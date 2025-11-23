@@ -5,30 +5,43 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>State.io Clone</title>
     <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         body {
             margin: 0;
-            padding: 20px;
+            padding: 0;
             display: flex;
             justify-content: center;
             align-items: center;
-            min-height: 100vh;
+            width: 100vw;
+            height: 100vh;
             background: #1a1a2e;
             font-family: Arial, sans-serif;
+            overflow: hidden;
         }
         canvas {
             border: 2px solid #16213e;
             background: #0f3460;
             cursor: pointer;
+            display: block;
         }
     </style>
 </head>
 <body>
-    <canvas id="gameCanvas" width="1000" height="700"></canvas>
+    <canvas id="gameCanvas"></canvas>
 
     <script src="https://cdn.jsdelivr.net/npm/d3-delaunay@6"></script>
     <script>
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
+
+        // Set initial canvas size
+        const padding = 20;
+        canvas.width = Math.min(1000, window.innerWidth - padding);
+        canvas.height = Math.min(700, window.innerHeight - padding);
 
         // Game constants
         const TROOP_SPEED = 2;
