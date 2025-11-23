@@ -294,6 +294,9 @@
             // Verify source still belongs to the original owner
             if (source.owner !== owner) return;
 
+            // Check adjacency
+            if (!areAdjacent(source, target)) return;
+
             // Check send cooldown
             const currentTime = Date.now();
             if (currentTime - source.lastSendTime < SEND_COOLDOWN) return;
@@ -472,12 +475,6 @@
 
             // Draw troops
             troops.forEach(t => t.draw());
-
-            // Draw UI
-            ctx.fillStyle = '#fff';
-            ctx.font = '16px Arial';
-            ctx.textAlign = 'left';
-            ctx.fillText('Click center dot to select, then click adjacent territory to send troops', 10, 20);
 
             // Draw game over message
             if (gameOver) {
