@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>State.io Clone</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: #1a1a2e;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            border: 2px solid #16213e;
+            background: #0f3460;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="1000" height="700"></canvas>
+
+    <script src="https://cdn.jsdelivr.net/npm/d3-delaunay@6"></script>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Game constants
+        const TROOP_SPEED = 2;
+        const GROWTH_INTERVAL = 2000; // milliseconds (slower growth)
+        const GROWTH_AMOUNT = 1;
+        const TROOPS_PER_CLICK = 1;
+        const SEND_COOLDOWN = 100; // milliseconds between sends from same territory
+
+        // Territory class
+        class Territory {
+            constructor(x, y, owner, maxPopulation) {
+                this.x = x;
+                this.y = y;
+                this.owner = owner; // 'player', 'enemy', 'neutral'
+                this.population = owner === 'neutral' ? Math.floor(maxPopulation * 0.3) : 5;
+                this.maxPopulation = maxPopulation;
+                this.radius = 40;
+                this.lastSendTime = 0;
+            }
+
+            grow() {
+                if (this.owner !== 'neutral' && this.population < this.maxPopulation) {
+                    this.population = Math.min(this.population + GROWTH_AMOUNT, this.maxPopulation);
+                }
+            }
+
+            getColor() {
+                switch(this.owner) {
+                    case 'player': return '#4ecdc4';
+                    case 'enemy': return '#ff6b6b';
+                    case 'neutral': return '#95a5a6';
+                }
+            }
+
+            contains(x, y) {
+                // Find which territory this point belongs to using Voronoi
+                const index = voronoi.delaunay.find(x, y);
+                return territories[index] === this;
+            }
+
+            containsCenter(x, y) {
+                // Check if point is within the center dot (for selection)
+                const dx = x - this.x;
+                const dy = y - this.y;
+                const centerRadius = 20; // Clickable radius for center
+                return dx * dx + dy * dy <= centerRadius * centerRadius;
+            }
+
+            draw() {
+                // Get the index of this territory
+                const index = territories.indexOf(this);
+
+                // Draw Voronoi cell
+                const cell = voronoi.cellPolygon(index);
+                if (cell) {
+                    ctx.beginPath();
+                    ctx.moveTo(cell[0][0], cell[0][1]);
+                    for (let i = 1; i < cell.length; i++) {
+                        ctx.lineTo(cell[i][0], cell[i][1]);
+                    }
+                    ctx.closePath();
+                    ctx.fillStyle = this.getColor();
+                    ctx.fill();
+                    ctx.strokeStyle = '#2c3e50';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                // Draw center dot
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, 15, 0, Math.PI * 2);
+                ctx.fillStyle = this.getColor();
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+
+                // Draw population text at territory center
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 16px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(Math.floor(this.population), this.x, this.y);
+            }
+        }
+
+        // Troop class (moving dots)
+        class Troop {
+            constructor(startX, startY, target, owner, count = 1) {
+                this.x = startX;
+                this.y = startY;
+                this.target = target;
+                this.owner = owner;
+                this.count = count;
+                this.radius = 5;
+
+                // Calculate direction
+                const dx = target.x - startX;
+                const dy = target.y - startY;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                this.vx = (dx / distance) * TROOP_SPEED;
+                this.vy = (dy / distance) * TROOP_SPEED;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // Check if arrived at target
+                const dx = this.target.x - this.x;
+                const dy = this.target.y - this.y;
+                const distanceToTarget = Math.sqrt(dx * dx + dy * dy);
+
+                return distanceToTarget <= this.target.radius;
+            }
+
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.owner === 'player' ? '#4ecdc4' : '#ff6b6b';
+                ctx.fill();
+                // Add black outline for visibility
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+        }
+
+        // Game state
+        let territories = [];
+        let troops = [];
+        let selectedTerritory = null;
+        let lastGrowthTime = Date.now();
+        let gameOver = false;
+        let winner = null;
+        let voronoi = null;
+        let aiAttackPlan = null; // { source, target, troopsNeeded, troopsSent }
+
+        // Generate random position that's not too close to existing positions
+        function generateRandomPosition(existingPositions, minDistance = 150) {
+            let attempts = 0;
+            while (attempts < 100) {
+                const x = Math.random() * (canvas.width - 100) + 50;
+                const y = Math.random() * (canvas.height - 100) + 50;
+
+                // Check distance from existing positions
+                let tooClose = false;
+                for (let pos of existingPositions) {
+                    const dx = pos.x - x;
+                    const dy = pos.y - y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < minDistance) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+
+                if (!tooClose) {
+                    return { x, y };
+                }
+                attempts++;
+            }
+            // Fallback if can't find good position
+            return {
+                x: Math.random() * (canvas.width - 100) + 50,
+                y: Math.random() * (canvas.height - 100) + 50
+            };
+        }
+
+        // Initialize game
+        function initGame() {
+            territories = [];
+            const positions = [];
+
+            // Player territory
+            const playerPos = generateRandomPosition(positions);
+            positions.push(playerPos);
+            territories.push(new Territory(playerPos.x, playerPos.y, 'player', 30));
+
+            // Enemy territory
+            const enemyPos = generateRandomPosition(positions);
+            positions.push(enemyPos);
+            territories.push(new Territory(enemyPos.x, enemyPos.y, 'enemy', 30));
+
+            // Neutral territories (5 of them)
+            for (let i = 0; i < 5; i++) {
+                const neutralPos = generateRandomPosition(positions);
+                positions.push(neutralPos);
+                territories.push(new Territory(neutralPos.x, neutralPos.y, 'neutral', 20));
+            }
+
+            // Generate Voronoi diagram
+            generateVoronoi();
+        }
+
+        // Generate Voronoi diagram from territory positions
+        function generateVoronoi() {
+            const points = territories.map(t => [t.x, t.y]);
+            const delaunay = d3.Delaunay.from(points);
+            voronoi = delaunay.voronoi([0, 0, canvas.width, canvas.height]);
+        }
+
+        // Check if two territories are adjacent (share a border)
+        function areAdjacent(territory1, territory2) {
+            const index1 = territories.indexOf(territory1);
+            const index2 = territories.indexOf(territory2);
+
+            // Get neighbors of territory1
+            const neighbors = Array.from(voronoi.delaunay.neighbors(index1));
+            return neighbors.includes(index2);
+        }
+
+        // Handle click
+        canvas.addEventListener('click', (e) => {
+            if (gameOver) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Find clicked territory
+            let clickedTerritory = null;
+            for (let territory of territories) {
+                if (territory.contains(x, y)) {
+                    clickedTerritory = territory;
+                    break;
+                }
+            }
+
+            if (!clickedTerritory) return;
+
+            // Check if clicked on center dot
+            const clickedCenter = clickedTerritory.containsCenter(x, y);
+
+            // If clicked center of own territory, select it
+            if (clickedCenter && clickedTerritory.owner === 'player') {
+                selectedTerritory = clickedTerritory;
+            }
+            // If have selection and clicked a different adjacent territory
+            else if (selectedTerritory && selectedTerritory !== clickedTerritory) {
+                if (areAdjacent(selectedTerritory, clickedTerritory)) {
+                    // Can send to any adjacent territory (own for reinforcement, or enemy/neutral for attack)
+                    sendTroops(selectedTerritory, clickedTerritory, 'player');
+                }
+            }
+        });
+
+        // Send troops from source to target
+        function sendTroops(source, target, owner) {
+            // Verify source still belongs to the original owner
+            if (source.owner !== owner) return;
+
+            // Check send cooldown
+            const currentTime = Date.now();
+            if (currentTime - source.lastSendTime < SEND_COOLDOWN) return;
+
+            if (source.population < TROOPS_PER_CLICK) return;
+
+            source.population -= TROOPS_PER_CLICK;
+            source.lastSendTime = currentTime;
+
+            // Create troop
+            const troop = new Troop(source.x, source.y, target, owner, TROOPS_PER_CLICK);
+            troops.push(troop);
+        }
+
+        // Handle troop arrival
+        function handleArrival(troop) {
+            const target = troop.target;
+
+            if (troop.owner === target.owner) {
+                // Friendly - add troops
+                target.population += troop.count;
+            } else {
+                // Enemy/neutral - combat
+                target.population -= troop.count;
+
+                if (target.population <= 0) {
+                    // Territory conquered
+                    target.owner = troop.owner;
+                    target.population = Math.abs(target.population);
+                }
+            }
+        }
+
+        // Check win/lose conditions
+        function checkGameOver() {
+            const playerTerritories = territories.filter(t => t.owner === 'player').length;
+            const enemyTerritories = territories.filter(t => t.owner === 'enemy').length;
+
+            if (playerTerritories === 0) {
+                gameOver = true;
+                winner = 'enemy';
+            } else if (enemyTerritories === 0) {
+                gameOver = true;
+                winner = 'player';
+            }
+        }
+
+        // Calculate distance between two points
+        function distance(x1, y1, x2, y2) {
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        // Calculate how many troops needed to capture a territory
+        function calculateRequiredTroops(source, target) {
+            const dist = distance(source.x, source.y, target.x, target.y);
+            const travelTime = dist / TROOP_SPEED;
+
+            // Estimate target's population when troops arrive
+            const growthTicks = Math.floor(travelTime / GROWTH_INTERVAL);
+            const estimatedPopulation = target.population + (growthTicks * GROWTH_AMOUNT);
+
+            // Add buffer for safety
+            return Math.ceil(estimatedPopulation) + 2;
+        }
+
+        // Update game state
+        function update() {
+            if (gameOver) return;
+
+            // Clear selection if territory no longer belongs to player
+            if (selectedTerritory && selectedTerritory.owner !== 'player') {
+                selectedTerritory = null;
+            }
+
+            // Check win/lose conditions
+            checkGameOver();
+
+            // Growth
+            const currentTime = Date.now();
+            if (currentTime - lastGrowthTime >= GROWTH_INTERVAL) {
+                territories.forEach(t => t.grow());
+                lastGrowthTime = currentTime;
+            }
+
+            // Update troops
+            for (let i = troops.length - 1; i >= 0; i--) {
+                const hasArrived = troops[i].update();
+                if (hasArrived) {
+                    handleArrival(troops[i]);
+                    troops.splice(i, 1);
+                }
+            }
+
+            // Smart Enemy AI - plan attacks
+            if (!aiAttackPlan) {
+                if (Math.random() < 0.02) {
+                    const enemyTerritories = territories.filter(t => t.owner === 'enemy' && t.population > 1);
+
+                    // Find best attack opportunity
+                    let bestAttack = null;
+                    let bestRatio = 0;
+
+                    for (let source of enemyTerritories) {
+                        const sourceIndex = territories.indexOf(source);
+                        const neighbors = Array.from(voronoi.delaunay.neighbors(sourceIndex));
+
+                        for (let targetIndex of neighbors) {
+                            const target = territories[targetIndex];
+
+                            // Only attack non-enemy territories
+                            if (target.owner === 'enemy') continue;
+
+                            // Calculate if we can win
+                            const troopsNeeded = target.population + 1;
+                            if (source.population > troopsNeeded) {
+                                const ratio = source.population / troopsNeeded;
+                                if (ratio > bestRatio) {
+                                    bestRatio = ratio;
+                                    bestAttack = { source, target, troopsNeeded };
+                                }
+                            }
+                        }
+                    }
+
+                    // Set attack plan
+                    if (bestAttack) {
+                        aiAttackPlan = { ...bestAttack, troopsSent: 0 };
+                    }
+                }
+            }
+
+            // Execute attack plan gradually
+            if (aiAttackPlan) {
+                const { source, target, troopsNeeded, troopsSent } = aiAttackPlan;
+
+                // Check if plan is still valid
+                if (source.owner !== 'enemy' || troopsSent >= troopsNeeded) {
+                    aiAttackPlan = null;
+                } else {
+                    // Send one troop (respects rate limit)
+                    const prevPopulation = source.population;
+                    sendTroops(source, target, 'enemy');
+                    if (source.population < prevPopulation) {
+                        aiAttackPlan.troopsSent++;
+                    }
+                }
+            }
+        }
+
+        // Draw everything
+        function draw() {
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw territories
+            territories.forEach(t => t.draw());
+
+            // Draw selection highlight
+            if (selectedTerritory) {
+                const index = territories.indexOf(selectedTerritory);
+                const cell = voronoi.cellPolygon(index);
+                if (cell) {
+                    ctx.beginPath();
+                    ctx.moveTo(cell[0][0], cell[0][1]);
+                    for (let i = 1; i < cell.length; i++) {
+                        ctx.lineTo(cell[i][0], cell[i][1]);
+                    }
+                    ctx.closePath();
+                    ctx.strokeStyle = '#f1c40f';
+                    ctx.lineWidth = 4;
+                    ctx.stroke();
+                }
+            }
+
+            // Draw troops
+            troops.forEach(t => t.draw());
+
+            // Draw UI
+            ctx.fillStyle = '#fff';
+            ctx.font = '16px Arial';
+            ctx.textAlign = 'left';
+            ctx.fillText('Click center dot to select, then click adjacent territory to send troops', 10, 20);
+
+            // Draw game over message
+            if (gameOver) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.fillStyle = winner === 'player' ? '#4ecdc4' : '#ff6b6b';
+                ctx.font = 'bold 72px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(winner === 'player' ? 'YOU WIN!' : 'YOU LOSE!', canvas.width / 2, canvas.height / 2);
+
+                ctx.fillStyle = '#fff';
+                ctx.font = '24px Arial';
+                ctx.fillText('Refresh to play again', canvas.width / 2, canvas.height / 2 + 60);
+            }
+        }
+
+        // Game loop
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start game
+        initGame();
+        gameLoop();
+    </script>
+</body>
+</html>
