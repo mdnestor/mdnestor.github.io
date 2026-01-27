@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>N-Body Gravitational Simulation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #0a0a1a;
+            color: #fff;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        h1 {
+            margin-bottom: 10px;
+            color: #7eb8ff;
+        }
+        .controls {
+            margin-bottom: 15px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        button {
+            padding: 10px 20px;
+            background: #2a4a7a;
+            border: none;
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #3a5a9a;
+        }
+        button.active {
+            background: #4a7a4a;
+        }
+        .preset-3d {
+            background: #5a3a7a;
+        }
+        .preset-3d:hover {
+            background: #7a4a9a;
+        }
+        canvas {
+            border: 1px solid #333;
+            border-radius: 8px;
+            cursor: crosshair;
+        }
+        .info {
+            margin-top: 15px;
+            color: #888;
+            font-size: 13px;
+            text-align: center;
+        }
+        .stats {
+            margin-top: 10px;
+            display: flex;
+            gap: 20px;
+            font-size: 14px;
+        }
+        .stat {
+            background: #1a1a2e;
+            padding: 8px 15px;
+            border-radius: 6px;
+        }
+        .stat-label {
+            color: #888;
+            font-size: 11px;
+        }
+        .mode-indicator {
+            background: #3a3a5a;
+            padding: 5px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .mode-3d {
+            background: #5a3a7a;
+        }
+    </style>
+</head>
+<body>
+    <h1>N-Body Simulation <span class="mode-indicator" id="modeIndicator">2D</span></h1>
+
+    <div class="controls">
+        <button onclick="loadPreset('twoBody')">Two Body</button>
+        <button onclick="loadPreset('earthMoonSun')">Earth-Moon-Sun</button>
+        <button onclick="loadPreset('solarSystem')">Inner Solar System</button>
+        <button onclick="loadPreset('randomSwirl')">Random Swirl</button>
+        <button onclick="loadPreset('binaryWithPlanet')">Binary + Planet</button>
+        <button class="preset-3d" onclick="loadPreset('sitnikov')">Sitnikov (3D)</button>
+        <button class="preset-3d" onclick="loadPreset('3dSwirl')">3D Swirl</button>
+        <button class="preset-3d" onclick="loadPreset('galaxyCollision')">Galaxy Collision</button>
+        <button onclick="clearBodies()">Clear</button>
+    </div>
+
+    <canvas id="canvas" width="800" height="700"></canvas>
+
+    <p class="info" id="instructions">Click to add bodies. Drag to give initial velocity. Shift+click for massive body.</p>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-label">Bodies</div>
+            <div id="bodyCount">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Time Scale</div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <button onclick="changeSpeed(-1)" style="padding: 2px 8px; font-size: 16px;">−</button>
+                <span id="timeScale" style="min-width: 40px; text-align: center;">1x</span>
+                <button onclick="changeSpeed(1)" style="padding: 2px 8px; font-size: 16px;">+</button>
+            </div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Total Energy</div>
+            <div id="energy">0</div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+
+        // Physics constants
+        const G = 1;
+        const SOFTENING = 5;
+
+        // State
+        let bodies = [];
+        let timeScale = 1;
+        let paused = false;
+        let dragStart = null;
+        let dragCurrent = null;
+        let shiftHeld = false;
+
+        // 3D camera - using rotation matrix instead of euler angles
+        let is3D = false;
+        let camDistance = 500;
+        let camTarget = null;  // body index to center camera on
+
+        // Sitnikov graph
+        let sitnikovMode = false;
+        let zHistory = [];
+        // Rotation matrix (3x3, stored as flat array row-major)
+        let rotMatrix = [
+            1, 0, 0,
+            0, 1, 0,
+            0, 0, 1
+        ];
+
+        function resetCamera() {
+            // Start looking from above at an angle
+            const elevation = 0.8;
+            const cosE = Math.cos(elevation);
+            const sinE = Math.sin(elevation);
+            rotMatrix = [
+                1, 0, 0,
+                0, cosE, -sinE,
+                0, sinE, cosE
+            ];
+        }
+
+        function multiplyMatrix(a, b) {
+            // Multiply two 3x3 matrices
+            return [
+                a[0]*b[0] + a[1]*b[3] + a[2]*b[6], a[0]*b[1] + a[1]*b[4] + a[2]*b[7], a[0]*b[2] + a[1]*b[5] + a[2]*b[8],
+                a[3]*b[0] + a[4]*b[3] + a[5]*b[6], a[3]*b[1] + a[4]*b[4] + a[5]*b[7], a[3]*b[2] + a[4]*b[5] + a[5]*b[8],
+                a[6]*b[0] + a[7]*b[3] + a[8]*b[6], a[6]*b[1] + a[7]*b[4] + a[8]*b[7], a[6]*b[2] + a[7]*b[5] + a[8]*b[8]
+            ];
+        }
+
+        function rotateCamera(dx, dy) {
+            // Rotate around screen X axis (vertical mouse movement)
+            const ax = -dy * 0.01;
+            const cosX = Math.cos(ax), sinX = Math.sin(ax);
+            const rotX = [
+                1, 0, 0,
+                0, cosX, -sinX,
+                0, sinX, cosX
+            ];
+
+            // Rotate around screen Y axis (horizontal mouse movement)
+            const ay = -dx * 0.01;
+            const cosY = Math.cos(ay), sinY = Math.sin(ay);
+            const rotY = [
+                cosY, 0, sinY,
+                0, 1, 0,
+                -sinY, 0, cosY
+            ];
+
+            // Apply rotations: new = rotY * rotX * current
+            rotMatrix = multiplyMatrix(rotY, multiplyMatrix(rotX, rotMatrix));
+        }
+
+        function applyRotation(x, y, z) {
+            return {
+                x: rotMatrix[0]*x + rotMatrix[1]*y + rotMatrix[2]*z,
+                y: rotMatrix[3]*x + rotMatrix[4]*y + rotMatrix[5]*z,
+                z: rotMatrix[6]*x + rotMatrix[7]*y + rotMatrix[8]*z
+            };
+        }
+
+        // Generate static star field in 3D
+        const stars = [];
+        for (let i = 0; i < 300; i++) {
+            // Random points on a large sphere around the scene
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+            const r = 2000 + Math.random() * 1000;
+            stars.push({
+                x: r * Math.sin(phi) * Math.cos(theta),
+                y: r * Math.sin(phi) * Math.sin(theta),
+                z: r * Math.cos(phi),
+                size: 0.5 + Math.random() * 1.2
+            });
+        }
+
+        class Body {
+            constructor(x, y, z, vx, vy, vz, mass, color) {
+                this.x = x;
+                this.y = y;
+                this.z = z;
+                this.vx = vx;
+                this.vy = vy;
+                this.vz = vz;
+                this.mass = mass;
+                this.color = color;
+                this.radius = mass === 0 ? 4 : Math.max(1, Math.pow(mass, 0.33) * 1.5);
+                this.trail = [];
+            }
+        }
+
+        // Project 3D point to 2D screen
+        function project(x, y, z) {
+            // Offset by camera target if set
+            if (camTarget !== null && bodies[camTarget]) {
+                x -= bodies[camTarget].x;
+                y -= bodies[camTarget].y;
+                z -= bodies[camTarget].z;
+            }
+
+            if (!is3D) {
+                return { x: centerX + x, y: centerY + y, scale: 1 };
+            }
+
+            // Apply rotation matrix
+            const r = applyRotation(x, y, z);
+
+            // Perspective projection with safety check
+            const denom = camDistance + r.z;
+            if (Math.abs(denom) < 1) {
+                // Behind or too close to camera - return off-screen
+                return { x: -1000, y: -1000, scale: 0.001, z: r.z };
+            }
+            const perspective = camDistance / denom;
+            const screenX = centerX + r.x * perspective;
+            const screenY = centerY - r.y * perspective;
+
+            return { x: screenX, y: screenY, scale: perspective, z: r.z };
+        }
+
+        // Presets
+        function loadPreset(name) {
+            bodies = [];
+            is3D = false;
+            camTarget = null;  // reset camera target
+            sitnikovMode = false;
+            zHistory = [];
+
+            if (name === 'twoBody') {
+                const m1 = 800 + Math.random() * 400, m2 = 800 + Math.random() * 400;
+                const dist = 120 + Math.random() * 60;
+                const v = Math.sqrt(G * m2 / dist) * (0.6 + Math.random() * 0.2);
+                const angle = Math.random() * Math.PI * 2;
+
+                bodies.push(new Body(-dist/2 * Math.cos(angle), -dist/2 * Math.sin(angle), 0,
+                    v * Math.sin(angle), -v * Math.cos(angle), 0, m1, '#ffaa00'));
+                bodies.push(new Body(dist/2 * Math.cos(angle), dist/2 * Math.sin(angle), 0,
+                    -v * Math.sin(angle), v * Math.cos(angle), 0, m2, '#00aaff'));
+                timeScale = 2;
+            }
+            else if (name === 'earthMoonSun') {
+                const sunMass = 9000 + Math.random() * 2000;
+                const earthMass = 350 + Math.random() * 100;
+                const moonMass = 0.5 + Math.random() * 1;
+
+                const earthDist = 180 + Math.random() * 40;
+                const moonDist = 15 + Math.random() * 6;
+                const earthAngle = Math.random() * Math.PI * 2;
+                const moonAngle = Math.random() * Math.PI * 2;
+
+                const earthV = Math.sqrt(G * sunMass / earthDist);
+                const moonVrel = Math.sqrt(G * earthMass / moonDist);
+
+                const earthX = earthDist * Math.cos(earthAngle);
+                const earthY = earthDist * Math.sin(earthAngle);
+                const earthVx = -earthV * Math.sin(earthAngle);
+                const earthVy = earthV * Math.cos(earthAngle);
+
+                const moonX = earthX + moonDist * Math.cos(moonAngle);
+                const moonY = earthY + moonDist * Math.sin(moonAngle);
+                const moonVx = earthVx - moonVrel * Math.sin(moonAngle);
+                const moonVy = earthVy + moonVrel * Math.cos(moonAngle);
+
+                bodies.push(new Body(0, 0, 0, 0, 0, 0, sunMass, '#ffdd44'));
+                bodies.push(new Body(earthX, earthY, 0, earthVx, earthVy, 0, earthMass, '#4488ff'));
+                bodies.push(new Body(moonX, moonY, 0, moonVx, moonVy, 0, moonMass, '#aaaaaa'));
+                timeScale = 2;
+            }
+            else if (name === 'solarSystem') {
+                const sunMass = 9000 + Math.random() * 2000;
+                bodies.push(new Body(0, 0, 0, 0, 0, 0, sunMass, '#ffdd44'));
+
+                const planets = [
+                    { dist: 50 + Math.random() * 20, mass: 3 + Math.random() * 4, color: '#aa8866' },
+                    { dist: 90 + Math.random() * 20, mass: 10 + Math.random() * 10, color: '#ddaa77' },
+                    { dist: 140 + Math.random() * 20, mass: 15 + Math.random() * 10, color: '#4488ff' },
+                    { dist: 200 + Math.random() * 40, mass: 8 + Math.random() * 8, color: '#ff6644' },
+                ];
+
+                planets.forEach(p => {
+                    const ecc = 0.9 + Math.random() * 0.15;  // slight eccentricity variation
+                    const v = Math.sqrt(G * sunMass / p.dist) * ecc;
+                    const angle = Math.random() * Math.PI * 2;
+                    bodies.push(new Body(
+                        p.dist * Math.cos(angle),
+                        p.dist * Math.sin(angle),
+                        0,
+                        -v * Math.sin(angle),
+                        v * Math.cos(angle),
+                        0,
+                        p.mass,
+                        p.color
+                    ));
+                });
+                timeScale = 2;
+            }
+            else if (name === 'randomSwirl') {
+                const centralMass = 4000 + Math.random() * 2000;
+                bodies.push(new Body(0, 0, 0, 0, 0, 0, centralMass, '#ffdd44'));
+
+                // Massive bodies with power law distribution
+                const numMassive = 30;
+                const swirlDir = Math.random() > 0.5 ? 1 : -1;  // random rotation direction
+                for (let i = 0; i < numMassive; i++) {
+                    const dist = 80 + Math.random() * 200;
+                    const angle = Math.random() * Math.PI * 2;
+                    const x = dist * Math.cos(angle);
+                    const y = dist * Math.sin(angle);
+
+                    const v = Math.sqrt(G * centralMass / dist) * (0.8 + Math.random() * 0.4);
+                    const vx = -v * Math.sin(angle) * swirlDir + (Math.random() - 0.5) * 0.5;
+                    const vy = v * Math.cos(angle) * swirlDir + (Math.random() - 0.5) * 0.5;
+
+                    // Power law: most are tiny, few are large
+                    const mass = 0.3 / Math.pow(Math.random(), 0.8);  // heavy tail
+                    const hue = 30 + Math.random() * 40;
+                    bodies.push(new Body(x, y, 0, vx, vy, 0, mass, `hsl(${hue}, 80%, 60%)`));
+                }
+
+                // Zero mass test particles
+                const numDust = 150;
+                for (let i = 0; i < numDust; i++) {
+                    const dist = 60 + Math.random() * 220;
+                    const angle = Math.random() * Math.PI * 2;
+                    const x = dist * Math.cos(angle);
+                    const y = dist * Math.sin(angle);
+
+                    const v = Math.sqrt(G * centralMass / dist) * (0.85 + Math.random() * 0.3);
+                    const vx = -v * Math.sin(angle) * swirlDir;
+                    const vy = v * Math.cos(angle) * swirlDir;
+
+                    const hue = 180 + Math.random() * 60;
+                    bodies.push(new Body(x, y, 0, vx, vy, 0, 0, `hsl(${hue}, 70%, 65%)`));
+                }
+                timeScale = 2;
+            }
+            else if (name === 'binaryWithPlanet') {
+                const m1 = 1500 + Math.random() * 1000, m2 = 1000 + Math.random() * 1000;
+                const binaryDist = 60 + Math.random() * 40;
+                const totalMass = m1 + m2;
+                const cm1 = binaryDist * m2 / totalMass;
+                const cm2 = binaryDist * m1 / totalMass;
+
+                const binaryEcc = 1.3 + Math.random() * 0.4;
+                const binaryV = Math.sqrt(G * totalMass / binaryDist) * 0.5;
+                const v1 = binaryV * m2 / totalMass * binaryEcc;
+                const v2 = binaryV * m1 / totalMass * binaryEcc;
+                const binaryAngle = Math.random() * Math.PI * 2;
+
+                bodies.push(new Body(-cm1 * Math.cos(binaryAngle), -cm1 * Math.sin(binaryAngle), 0,
+                    v1 * Math.sin(binaryAngle), -v1 * Math.cos(binaryAngle), 0, m1, '#ffaa44'));
+                bodies.push(new Body(cm2 * Math.cos(binaryAngle), cm2 * Math.sin(binaryAngle), 0,
+                    -v2 * Math.sin(binaryAngle), v2 * Math.cos(binaryAngle), 0, m2, '#ff6644'));
+
+                const planetDist = 220 + Math.random() * 60;
+                const planetAngle = Math.random() * Math.PI * 2;
+                const planetV = Math.sqrt(G * totalMass / planetDist) * (0.95 + Math.random() * 0.1);
+                bodies.push(new Body(planetDist * Math.cos(planetAngle), planetDist * Math.sin(planetAngle), 0,
+                    -planetV * Math.sin(planetAngle), planetV * Math.cos(planetAngle), 0, 15 + Math.random() * 10, '#44aaff'));
+
+                timeScale = 2;
+            }
+            else if (name === 'sitnikov') {
+                // Sitnikov problem: two equal masses on elliptical orbits, third oscillates along z-axis
+                is3D = true;
+                const m = 2500 + Math.random() * 1000;
+                const r = 20 + Math.random() * 10;   // periapsis distance
+
+                // For two equal masses at distance r from COM (separation 2r):
+                // F = G*m*m/(2r)² and F = m*v²/r gives v = sqrt(G*m/(4r))
+                const vCircular = Math.sqrt(G * m / (4 * r));
+
+                // Moderate eccentricity - close passes induce chaos in third body
+                const ecc = 1.1 + Math.random() * 0.2;
+                const v = vCircular * ecc;
+
+                // Random starting angle for primaries
+                const angle = Math.random() * Math.PI * 2;
+                const px = r * Math.cos(angle), py = r * Math.sin(angle);
+                const vx = -v * Math.sin(angle), vy = v * Math.cos(angle);
+
+                // Two primaries - exactly symmetric about origin
+                bodies.push(new Body(-px, -py, 0, -vx, -vy, 0, m, '#ffaa00'));
+                bodies.push(new Body(px, py, 0, vx, vy, 0, m, '#00aaff'));
+
+                // Third body on z-axis - ZERO MASS test particle
+                const zHeight = 40 + Math.random() * 30;
+                const zDir = Math.random() > 0.5 ? 1 : -1;
+                bodies.push(new Body(0, 0, zHeight * zDir, 0, 0, 0, 0, '#ff44aa'));
+
+                timeScale = 1;
+                resetCamera();
+                sitnikovMode = true;  // enable z-position graph
+            }
+            else if (name === '3dSwirl') {
+                // 3D cloud that collapses into a disk
+                is3D = true;
+                const centralMass = 6000 + Math.random() * 4000;
+                bodies.push(new Body(0, 0, 0, 0, 0, 0, centralMass, '#ffdd44'));
+
+                // Massive bodies with power law distribution
+                const numMassive = 40;
+                const swirlDir3d = Math.random() > 0.5 ? 1 : -1;  // random rotation direction
+                for (let i = 0; i < numMassive; i++) {
+                    // Spherical distribution
+                    const r = 60 + Math.random() * 150;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+
+                    const x = r * Math.sin(phi) * Math.cos(theta);
+                    const y = r * Math.sin(phi) * Math.sin(theta);
+                    const z = r * Math.cos(phi);
+
+                    const dist2d = Math.sqrt(x*x + y*y) || 1;
+                    const v = Math.sqrt(G * centralMass / r) * (0.6 + Math.random() * 0.4);
+
+                    const vx = -v * (y / dist2d) * 0.7 * swirlDir3d + (Math.random() - 0.5) * v * 0.5;
+                    const vy = v * (x / dist2d) * 0.7 * swirlDir3d + (Math.random() - 0.5) * v * 0.5;
+                    const vz = (Math.random() - 0.5) * v * 0.5;
+
+                    // Power law mass: most tiny, few large
+                    const mass = 0.3 / Math.pow(Math.random(), 0.8);
+                    const hue = 30 + Math.random() * 40;
+                    bodies.push(new Body(x, y, z, vx, vy, vz, mass, `hsl(${hue}, 80%, 60%)`));
+                }
+
+                // Zero mass test particles
+                const numDust = 200;
+                for (let i = 0; i < numDust; i++) {
+                    const r = 50 + Math.random() * 170;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+
+                    const x = r * Math.sin(phi) * Math.cos(theta);
+                    const y = r * Math.sin(phi) * Math.sin(theta);
+                    const z = r * Math.cos(phi);
+
+                    const dist2d = Math.sqrt(x*x + y*y) || 1;
+                    const v = Math.sqrt(G * centralMass / r) * (0.6 + Math.random() * 0.4);
+
+                    const vx = -v * (y / dist2d) * 0.7 * swirlDir3d + (Math.random() - 0.5) * v * 0.4;
+                    const vy = v * (x / dist2d) * 0.7 * swirlDir3d + (Math.random() - 0.5) * v * 0.4;
+                    const vz = (Math.random() - 0.5) * v * 0.4;
+
+                    const hue = 200 + Math.random() * 80;
+                    bodies.push(new Body(x, y, z, vx, vy, vz, 0, `hsl(${hue}, 70%, 65%)`));
+                }
+                timeScale = 2;
+                resetCamera();
+            }
+            else if (name === 'galaxyCollision') {
+                // Two galaxies colliding at an oblique angle
+                is3D = true;
+
+                const galaxyMass = 1500 + Math.random() * 1000;
+                const numStars = 320; // per galaxy
+                const galaxySep = 900 + Math.random() * 200;
+
+                // Galaxy 1 - offset with some randomness
+                const g1offset = 300 + Math.random() * 200;
+                const g1x = -galaxySep / 2, g1y = -g1offset, g1z = -60 - Math.random() * 40;
+                const g1vx = 0.5 + Math.random() * 0.2, g1vy = Math.random() * 0.1, g1vz = 0.0;
+                bodies.push(new Body(g1x, g1y, g1z, g1vx, g1vy, g1vz, galaxyMass, '#ffaa44'));
+
+                // Galaxy 1 stars - disk tilted slightly
+                const tilt1 = 0.2 + Math.random() * 0.3;
+                for (let i = 0; i < numStars; i++) {
+                    const r = 25 + Math.random() * 60;
+                    const angle = Math.random() * Math.PI * 2;
+                    // Spiral arm offset
+                    const spiralAngle = angle + r * 0.03;
+
+                    // Disk in XY plane, tilted around X
+                    const tilt = tilt1;
+                    let x = r * Math.cos(spiralAngle);
+                    let y = r * Math.sin(spiralAngle) * Math.cos(tilt);
+                    let z = r * Math.sin(spiralAngle) * Math.sin(tilt);
+
+                    // Orbital velocity
+                    const v = Math.sqrt(G * galaxyMass / r);
+                    let vx = -v * Math.sin(spiralAngle);
+                    let vy = v * Math.cos(spiralAngle) * Math.cos(tilt);
+                    let vz = v * Math.cos(spiralAngle) * Math.sin(tilt);
+
+                    const hue = 30 + Math.random() * 30;
+                    bodies.push(new Body(
+                        g1x + x, g1y + y, g1z + z,
+                        g1vx + vx, g1vy + vy, g1vz + vz,
+                        0, `hsl(${hue}, 80%, 65%)`  // zero mass - test particles
+                    ));
+                }
+
+                // Galaxy 2 - offset above, moving left (wide flyby)
+                const g2offset = 300 + Math.random() * 200;
+                const g2x = galaxySep / 2, g2y = g2offset, g2z = 60 + Math.random() * 40;
+                const g2vx = -0.5 - Math.random() * 0.2, g2vy = -Math.random() * 0.1, g2vz = 0.0;
+                bodies.push(new Body(g2x, g2y, g2z, g2vx, g2vy, g2vz, galaxyMass, '#44aaff'));
+
+                // Galaxy 2 stars - disk tilted differently
+                const tilt2 = -0.3 - Math.random() * 0.4;
+                for (let i = 0; i < numStars; i++) {
+                    const r = 25 + Math.random() * 60;
+                    const angle = Math.random() * Math.PI * 2;
+                    const spiralAngle = angle + r * 0.03;
+
+                    // Disk tilted around Y
+                    const tilt = tilt2;
+                    let x = r * Math.cos(spiralAngle) * Math.cos(tilt);
+                    let y = r * Math.sin(spiralAngle);
+                    let z = r * Math.cos(spiralAngle) * Math.sin(tilt);
+
+                    const v = Math.sqrt(G * galaxyMass / r);
+                    let vx = -v * Math.sin(spiralAngle) * Math.cos(tilt);
+                    let vy = v * Math.cos(spiralAngle);
+                    let vz = -v * Math.sin(spiralAngle) * Math.sin(tilt);
+
+                    const hue = 200 + Math.random() * 40;
+                    bodies.push(new Body(
+                        g2x + x, g2y + y, g2z + z,
+                        g2vx + vx, g2vy + vy, g2vz + vz,
+                        0, `hsl(${hue}, 80%, 65%)`  // zero mass - test particles
+                    ));
+                }
+
+                timeScale = 2;
+                resetCamera();
+                camTarget = 0;  // follow first galaxy core
+            }
+
+            updateModeIndicator();
+            document.getElementById('timeScale').textContent = timeScale + 'x';
+            updateStats();
+        }
+
+        function updateModeIndicator() {
+            const indicator = document.getElementById('modeIndicator');
+            const instructions = document.getElementById('instructions');
+            if (is3D) {
+                indicator.textContent = '3D';
+                indicator.classList.add('mode-3d');
+                instructions.textContent = 'Drag to rotate camera. +/- for time scale. Space to pause.';
+                canvas.style.cursor = 'grab';
+            } else {
+                indicator.textContent = '2D';
+                indicator.classList.remove('mode-3d');
+                instructions.textContent = 'Click to add bodies. Drag to give initial velocity. Shift+click for massive body.';
+                canvas.style.cursor = 'crosshair';
+            }
+        }
+
+        function clearBodies() {
+            bodies = [];
+            is3D = false;
+            updateModeIndicator();
+            updateStats();
+        }
+
+        function changeSpeed(dir) {
+            if (dir > 0) {
+                timeScale = Math.min(timeScale * 2, 32);
+            } else {
+                timeScale = Math.max(timeScale / 2, 0.25);
+            }
+            document.getElementById('timeScale').textContent = timeScale + 'x';
+        }
+
+        function updateStats() {
+            document.getElementById('bodyCount').textContent = bodies.length;
+
+            let KE = 0, PE = 0;
+            bodies.forEach((b, i) => {
+                KE += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz);
+                for (let j = i + 1; j < bodies.length; j++) {
+                    const dx = bodies[j].x - b.x;
+                    const dy = bodies[j].y - b.y;
+                    const dz = bodies[j].z - b.z;
+                    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz + SOFTENING * SOFTENING);
+                    PE -= G * b.mass * bodies[j].mass / dist;
+                }
+            });
+            document.getElementById('energy').textContent = (KE + PE).toFixed(1);
+        }
+
+        function updatePhysics(dt) {
+            if (bodies.length < 1) return;
+
+            // Separate massive bodies from test particles (mass = 0)
+            const massive = [];
+            const massiveIdx = [];
+            bodies.forEach((b, i) => {
+                if (b.mass > 0) {
+                    massive.push(b);
+                    massiveIdx.push(i);
+                }
+            });
+
+            const ax = new Array(bodies.length).fill(0);
+            const ay = new Array(bodies.length).fill(0);
+            const az = new Array(bodies.length).fill(0);
+
+            // Massive bodies interact with each other (N² but small N)
+            for (let i = 0; i < massive.length; i++) {
+                for (let j = i + 1; j < massive.length; j++) {
+                    const bi = massive[i], bj = massive[j];
+                    const dx = bj.x - bi.x;
+                    const dy = bj.y - bi.y;
+                    const dz = bj.z - bi.z;
+                    const distSq = dx * dx + dy * dy + dz * dz + SOFTENING * SOFTENING;
+                    const dist = Math.sqrt(distSq);
+                    const force = G / distSq;
+
+                    const fx = force * dx / dist;
+                    const fy = force * dy / dist;
+                    const fz = force * dz / dist;
+
+                    const ii = massiveIdx[i], jj = massiveIdx[j];
+                    ax[ii] += fx * bj.mass;
+                    ay[ii] += fy * bj.mass;
+                    az[ii] += fz * bj.mass;
+                    ax[jj] -= fx * bi.mass;
+                    ay[jj] -= fy * bi.mass;
+                    az[jj] -= fz * bi.mass;
+                }
+            }
+
+            // All bodies feel gravity from massive bodies only
+            bodies.forEach((b, i) => {
+                if (b.mass > 0) return; // already computed above
+                for (let j = 0; j < massive.length; j++) {
+                    const bj = massive[j];
+                    const dx = bj.x - b.x;
+                    const dy = bj.y - b.y;
+                    const dz = bj.z - b.z;
+                    const distSq = dx * dx + dy * dy + dz * dz + SOFTENING * SOFTENING;
+                    const dist = Math.sqrt(distSq);
+                    const force = G * bj.mass / distSq;
+
+                    ax[i] += force * dx / dist;
+                    ay[i] += force * dy / dist;
+                    az[i] += force * dz / dist;
+                }
+            });
+
+            bodies.forEach((b, i) => {
+                b.vx += ax[i] * dt;
+                b.vy += ay[i] * dt;
+                b.vz += az[i] * dt;
+                b.x += b.vx * dt;
+                b.y += b.vy * dt;
+                b.z += b.vz * dt;
+
+                b.trail.push({ x: b.x, y: b.y, z: b.z });
+                if (b.trail.length > 150) b.trail.shift();
+            });
+
+            // Sitnikov constraint: keep third body on z-axis and primaries symmetric
+            if (sitnikovMode && bodies.length >= 3) {
+                // Force primary symmetry (body 0 and 1)
+                const avgX = (bodies[0].x - bodies[1].x) / 2;
+                const avgY = (bodies[0].y - bodies[1].y) / 2;
+                const avgVx = (bodies[0].vx - bodies[1].vx) / 2;
+                const avgVy = (bodies[0].vy - bodies[1].vy) / 2;
+                bodies[0].x = avgX; bodies[1].x = -avgX;
+                bodies[0].y = avgY; bodies[1].y = -avgY;
+                bodies[0].z = 0; bodies[1].z = 0;
+                bodies[0].vx = avgVx; bodies[1].vx = -avgVx;
+                bodies[0].vy = avgVy; bodies[1].vy = -avgVy;
+                bodies[0].vz = 0; bodies[1].vz = 0;
+
+                // Constrain third body to z-axis
+                bodies[2].x = 0;
+                bodies[2].y = 0;
+                bodies[2].vx = 0;
+                bodies[2].vy = 0;
+            }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#0a0a1a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+
+            // Draw grid and axes in 3D mode
+            if (is3D) {
+                const gridSize = 300;
+                const gridStep = 50;
+
+                // Draw grid on XY plane (z=0)
+                ctx.strokeStyle = '#ffffff15';
+                ctx.lineWidth = 1;
+
+                // Grid lines parallel to X axis
+                for (let y = -gridSize; y <= gridSize; y += gridStep) {
+                    const p1 = project(-gridSize, y, 0);
+                    const p2 = project(gridSize, y, 0);
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.stroke();
+                }
+
+                // Grid lines parallel to Y axis
+                for (let x = -gridSize; x <= gridSize; x += gridStep) {
+                    const p1 = project(x, -gridSize, 0);
+                    const p2 = project(x, gridSize, 0);
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.stroke();
+                }
+
+                // Draw axes
+                const axisLen = 80;
+                const axes = [
+                    { dir: [axisLen, 0, 0], color: '#ff4444', label: 'X' },
+                    { dir: [0, axisLen, 0], color: '#44ff44', label: 'Y' },
+                    { dir: [0, 0, axisLen], color: '#4444ff', label: 'Z' },
+                ];
+                const origin = project(0, 0, 0);
+                axes.forEach(axis => {
+                    const end = project(axis.dir[0], axis.dir[1], axis.dir[2]);
+                    ctx.beginPath();
+                    ctx.moveTo(origin.x, origin.y);
+                    ctx.lineTo(end.x, end.y);
+                    ctx.strokeStyle = axis.color;
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+
+                    // Label
+                    ctx.fillStyle = axis.color;
+                    ctx.font = '12px sans-serif';
+                    ctx.fillText(axis.label, end.x + 5, end.y + 5);
+                });
+            }
+
+            // Sort bodies by z for proper depth rendering in 3D
+            const sortedBodies = [...bodies].map((b, idx) => ({ body: b, idx }));
+            if (is3D) {
+                sortedBodies.sort((a, b) => {
+                    const pa = project(a.body.x, a.body.y, a.body.z);
+                    const pb = project(b.body.x, b.body.y, b.body.z);
+                    return pb.z - pa.z; // far to near
+                });
+            }
+
+            // Draw trails
+            sortedBodies.forEach(({ body: b }) => {
+                if (b.trail.length > 1) {
+                    ctx.beginPath();
+                    const p0 = project(b.trail[0].x, b.trail[0].y, b.trail[0].z);
+                    ctx.moveTo(p0.x, p0.y);
+                    for (let i = 1; i < b.trail.length; i++) {
+                        const p = project(b.trail[i].x, b.trail[i].y, b.trail[i].z);
+                        ctx.lineTo(p.x, p.y);
+                    }
+                    ctx.strokeStyle = b.color + '40';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            });
+
+            // Draw bodies
+            sortedBodies.forEach(({ body: b }) => {
+                const p = project(b.x, b.y, b.z);
+                const r = b.radius * p.scale;
+
+                // Glow for large bodies
+                if (b.mass > 500) {
+                    const gradient = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 3);
+                    gradient.addColorStop(0, b.color + '80');
+                    gradient.addColorStop(1, b.color + '00');
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, r * 3, 0, Math.PI * 2);
+                    ctx.fillStyle = gradient;
+                    ctx.fill();
+                }
+
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, Math.max(2, r), 0, Math.PI * 2);
+                ctx.fillStyle = b.color;
+                ctx.fill();
+            });
+
+            // Draw drag indicator (2D only)
+            if (!is3D && dragStart && dragCurrent) {
+                ctx.beginPath();
+                ctx.moveTo(dragStart.x, dragStart.y);
+                ctx.lineTo(dragCurrent.x, dragCurrent.y);
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(dragStart.x, dragStart.y, shiftHeld ? 15 : 5, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(255,255,255,0.5)';
+                ctx.fill();
+            }
+
+            // Sitnikov z-position graph in 3D space - trails off from the body
+            if (sitnikovMode && zHistory.length > 1 && bodies.length > 2) {
+                const body = bodies[2];
+                ctx.beginPath();
+
+                // Draw the z-history as a 3D ribbon extending in -X direction from body
+                for (let i = 0; i < zHistory.length; i++) {
+                    // Position in 3D: extends in -X, z-value shown as height
+                    const trailX = body.x - (zHistory.length - i) * 1.2;  // trail extends left
+                    const trailY = body.y;
+                    const trailZ = zHistory[i];  // actual z value as height
+
+                    const p = project(trailX, trailY, trailZ);
+                    if (i === 0) ctx.moveTo(p.x, p.y);
+                    else ctx.lineTo(p.x, p.y);
+                }
+
+                ctx.strokeStyle = '#ff44aa';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Draw zero-line reference in 3D
+                ctx.beginPath();
+                const startP = project(body.x - zHistory.length * 1.2, body.y, 0);
+                const endP = project(body.x, body.y, 0);
+                ctx.moveTo(startP.x, startP.y);
+                ctx.lineTo(endP.x, endP.y);
+                ctx.strokeStyle = 'rgba(255, 68, 170, 0.3)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+        }
+
+        // Animation loop
+        let lastTime = 0;
+        function animate(currentTime) {
+            const dt = Math.min((currentTime - lastTime) / 1000, 0.1) * timeScale * 8;
+            lastTime = currentTime;
+
+            if (!paused) {
+                const substeps = 16;
+                for (let i = 0; i < substeps; i++) {
+                    updatePhysics(dt / substeps);
+                }
+
+                // Record z position for Sitnikov graph (body index 2 is the third body)
+                if (sitnikovMode && bodies.length > 2) {
+                    zHistory.push(bodies[2].z);
+                    if (zHistory.length > 600) zHistory.shift();
+                }
+            }
+
+            draw();
+            requestAnimationFrame(animate);
+        }
+
+        // Input handling
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            dragStart = {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+            dragCurrent = { ...dragStart };
+            if (is3D) canvas.style.cursor = 'grabbing';
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (dragStart) {
+                const rect = canvas.getBoundingClientRect();
+                const newX = e.clientX - rect.left;
+                const newY = e.clientY - rect.top;
+
+                if (is3D) {
+                    // Rotate camera using rotation matrix - feels the same everywhere
+                    rotateCamera(newX - dragCurrent.x, newY - dragCurrent.y);
+                }
+
+                dragCurrent = { x: newX, y: newY };
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (dragStart) {
+                if (!is3D) {
+                    const rect = canvas.getBoundingClientRect();
+                    const endX = e.clientX - rect.left;
+                    const endY = e.clientY - rect.top;
+
+                    const vx = (endX - dragStart.x) * 0.05;
+                    const vy = (endY - dragStart.y) * 0.05;
+
+                    const mass = shiftHeld ? 1000 : 10;
+                    const hue = Math.random() * 360;
+                    const color = `hsl(${hue}, 70%, 60%)`;
+
+                    // Convert screen to world coords (2D)
+                    const worldX = dragStart.x - centerX;
+                    const worldY = dragStart.y - centerY;
+
+                    bodies.push(new Body(worldX, worldY, 0, vx, vy, 0, mass, color));
+                    updateStats();
+                }
+
+                dragStart = null;
+                dragCurrent = null;
+                if (is3D) canvas.style.cursor = 'grab';
+            }
+        });
+
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Shift') shiftHeld = true;
+            if (e.key === ' ') { e.preventDefault(); paused = !paused; }
+            if (e.key === '+' || e.key === '=') {
+                timeScale = Math.min(timeScale * 2, 16);
+                document.getElementById('timeScale').textContent = timeScale + 'x';
+            }
+            if (e.key === '-') {
+                timeScale = Math.max(timeScale / 2, 0.25);
+                document.getElementById('timeScale').textContent = timeScale + 'x';
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (e.key === 'Shift') shiftHeld = false;
+        });
+
+        setInterval(updateStats, 500);
+
+        loadPreset('twoBody');
+        requestAnimationFrame(animate);
+    </script>
+</body>
+</html>
