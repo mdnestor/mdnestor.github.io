@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>N-body sim</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; font-family: monospace; color: #fff; }
+canvas { display: block; }
+#ui {
+  position: fixed; top: 10px; left: 10px;
+  background: rgba(0,0,0,0.6); padding: 10px; border: 1px solid #333;
+  font-size: 12px; user-select: none;
+}
+#ui button { background: #222; color: #fff; border: 1px solid #555; padding: 3px 8px; cursor: pointer; margin: 2px; }
+#ui button:hover { background: #444; }
+#speed-val { display: inline-block; width: 40px; text-align: center; }
+#ui input[type=range] { width: 110px; vertical-align: middle; cursor: pointer; direction: ltr; accent-color: #4488ff; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div>N-body sim | WebGPU</div>
+  <div style="margin-top:6px">
+    <button onclick="changeSpeed(-1)">-</button>
+    <span id="speed-val">1x</span>
+    <button onclick="changeSpeed(1)">+</button>
+    &nbsp;Speed
+  </div>
+  <div style="margin-top:6px">
+    <button onclick="changeN(-1)">½</button>
+    <button onclick="changeN(1)">×2</button>
+    <span id="n-val"></span> bodies
+  </div>
+  <div style="margin-top:4px">
+    <input type="range" id="exp-slider" min="0" max="100" value="0" style="width:110px">
+    H=<span id="exp-val">0.00</span>
+  </div>
+  <div style="margin-top:4px; color:#888; font-size:11px">
+    SPACE=pause R=reset<br>Drag=rotate Wheel=zoom<br>WASD=pan Shift=up Ctrl=down
+  </div>
+</div>
+<script>
+let N = 32768;
+const DT_BASE = 0.003;
+const SOFTENING = 0.04;
+const G = 1.0;
+const BOX_L = 4.0;   // periodic box side length
+const M_STAR = 1.0 / N;
+
+let speedMult = 1;
+let paused = false;
+let speedLevels = [0.1, 0.25, 0.5, 1, 2, 4, 8, 16];
+let speedIdx = 3;
+
+function changeSpeed(d) {
+  speedIdx = Math.max(0, Math.min(speedLevels.length - 1, speedIdx + d));
+  speedMult = speedLevels[speedIdx];
+  document.getElementById('speed-val').textContent = speedMult + 'x';
+}
+
+// N slider: log2 scale (value = log2(N))
+function changeN(dir) {
+  const MIN_N = 512, MAX_N = 1 << 19; // 512 to 524288
+  const next = dir > 0 ? N * 2 : N / 2;
+  if (next < MIN_N || next > MAX_N) return;
+  N = next;
+  document.getElementById('n-val').textContent = N.toLocaleString();
+  if (window._gpuReady) init();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('n-val').textContent = N.toLocaleString();
+
+  document.getElementById('exp-slider').addEventListener('input', e => {
+    expansionRate = parseInt(e.target.value) / 100 * 1.0;
+    document.getElementById('exp-val').textContent = expansionRate.toFixed(2);
+  });
+});
+
+// Expansion: G_eff = G / (1 + H*t)^2  — equivalent to distances growing as a(t) = 1 + H*t
+let expansionRate = 0.0;
+let simTime = 0.0;
+
+// Camera
+let camTheta = 0.6, camPhi = 0.9, camDist = 7.0;
+let camTarget = [BOX_L/2, BOX_L/2, BOX_L/2];
+let mouseDown = false, lastMX = 0, lastMY = 0;
+const keys = {};
+
+window.addEventListener('mousedown', e => {
+  if (e.target.closest('#ui')) return;
+  mouseDown = true; lastMX = e.clientX; lastMY = e.clientY;
+});
+window.addEventListener('mouseup', () => mouseDown = false);
+window.addEventListener('mousemove', e => {
+  if (!mouseDown) return;
+  camTheta -= (e.clientX - lastMX) * 0.005;
+  camPhi = Math.max(0.05, Math.min(Math.PI - 0.05, camPhi + (e.clientY - lastMY) * 0.005));
+  lastMX = e.clientX; lastMY = e.clientY;
+});
+window.addEventListener('wheel', e => { camDist *= 1 + e.deltaY * 0.001; camDist = Math.max(0.1, Math.min(50, camDist)); });
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  if (e.code === 'KeyR') { camTarget = [BOX_L/2, BOX_L/2, BOX_L/2]; init(); }
+  if (['KeyW','KeyA','KeyS','KeyD','ShiftLeft','ShiftRight','ControlLeft','ControlRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function updateCameraMovement() {
+  const sP = Math.sin(camPhi), cP = Math.cos(camPhi);
+  const sT = Math.sin(camTheta), cT = Math.cos(camTheta);
+  // Forward = direction from eye toward target
+  const fw = [-sP*cT, -cP, -sP*sT];
+  // Right = cross(forward, worldUp), always horizontal
+  const rt = [sT, 0, -cT];
+  // Camera up = cross(right, forward)
+  const cu = [rt[1]*fw[2]-rt[2]*fw[1], rt[2]*fw[0]-rt[0]*fw[2], rt[0]*fw[1]-rt[1]*fw[0]];
+
+  const speed = camDist * 0.02;
+  const move = (v, s) => { camTarget[0]+=v[0]*s; camTarget[1]+=v[1]*s; camTarget[2]+=v[2]*s; };
+  if (keys['KeyW']) move(fw,  speed);
+  if (keys['KeyS']) move(fw, -speed);
+  if (keys['KeyA']) move(rt, -speed);
+  if (keys['KeyD']) move(rt,  speed);
+  if (keys['ShiftLeft']  ||keys['ShiftRight'])   move(cu,  speed);
+  if (keys['ControlLeft']||keys['ControlRight']) move(cu, -speed);
+}
+
+// Random init in periodic box [0, BOX_L]^3
+function galaxyPositions() {
+  const pos = new Float32Array(N * 4);
+  const vel = new Float32Array(N * 4);
+  const sigma = 0.15;  // initial velocity dispersion
+  for (let i = 0; i < N; i++) {
+    pos[i*4+0] = Math.random() * BOX_L;
+    pos[i*4+1] = Math.random() * BOX_L;
+    pos[i*4+2] = Math.random() * BOX_L;
+    pos[i*4+3] = M_STAR;
+    vel[i*4+0] = (Math.random()-0.5) * sigma;
+    vel[i*4+1] = (Math.random()-0.5) * sigma;
+    vel[i*4+2] = (Math.random()-0.5) * sigma;
+    vel[i*4+3] = 0;
+  }
+  return { pos, vel };
+}
+
+let device, context, pipeline, renderPipeline;
+let posBufferA, posBufferB, velBufferA, velBufferB;
+let uniformBuf, bindGroupA, bindGroupB;
+let renderBindGroupA, renderBindGroupB;
+let step = 0;
+
+async function main() {
+  const canvas = document.getElementById('c');
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; });
+
+  if (!navigator.gpu) { alert('WebGPU not supported!'); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  device = await adapter.requestDevice();
+  context = canvas.getContext('webgpu');
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format: fmt, alphaMode: 'opaque' });
+
+  // Compute shader — O(N²) tiled, periodic boundary (minimum image convention)
+  const computeSrc = `
+struct Params { dt:f32, Nf:f32, soft:f32, G:f32, L:f32, Hdrag:f32, _b:f32, _c:f32 }
+@group(0) @binding(0) var<storage, read>       inPos:  array<vec4f>;
+@group(0) @binding(1) var<storage, read>       inVel:  array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> outPos: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> outVel: array<vec4f>;
+@group(0) @binding(4) var<uniform>             params: Params;
+
+var<workgroup> sharedPos: array<vec4f, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u,
+        @builtin(local_invocation_id)  lid: vec3u) {
+  let i = gid.x;
+  let Np = u32(params.Nf);
+  if (i >= Np) { return; }
+
+  let dt    = params.dt;
+  let soft2 = params.soft * params.soft;
+  let g     = params.G;
+  let L     = params.L;
+
+  let pi = inPos[i].xyz;
+  let mi = inPos[i].w;
+  var vi = inVel[i].xyz;
+  var acc = vec3f(0.0);
+
+  let tiles = (Np + 255u) / 256u;
+  for (var t = 0u; t < tiles; t++) {
+    let j = t * 256u + lid.x;
+    sharedPos[lid.x] = select(vec4f(0.0), inPos[j], j < Np);
+    workgroupBarrier();
+
+    for (var k = 0u; k < 256u; k++) {
+      let pj = sharedPos[k];
+      let mj = pj.w;
+      // Minimum image convention: nearest periodic image
+      var r = pj.xyz - pi;
+      r = r - round(r / L) * L;
+      let dist2 = dot(r, r) + soft2;
+      let inv_dist3 = inverseSqrt(dist2 * dist2 * dist2);
+      acc += r * (g * mj * inv_dist3);
+    }
+    workgroupBarrier();
+  }
+
+  vi += acc * dt;
+  vi *= (1.0 - params.Hdrag * dt);  // Hubble drag: damps peculiar velocities
+
+  // Wrap position into [0, L]
+  var np = pi + vi * dt;
+  np = np - floor(np / L) * L;
+
+  outVel[i] = vec4f(vi, mi);
+  outPos[i] = vec4f(np, mi);
+}
+`;
+
+  // Render shader — one point per particle
+  const renderSrc = `
+struct RenderUni { mvp: mat4x4f, info: vec4f }  // info.w = BOX_L/2
+@group(0) @binding(0) var<storage, read> positions: array<vec4f>;
+@group(0) @binding(1) var<uniform> uni: RenderUni;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f }
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  let p    = positions[vi];
+  out.pos  = uni.mvp * vec4f(p.xyz, 1.0);
+  let half = uni.info.w;
+  let t    = clamp(length(p.xyz - vec3f(half)) / half, 0.0, 1.0);
+  out.col  = vec4f(0.55 + t*0.45, 0.75 + t*0.25, 1.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f { return in.col; }
+`;
+
+  const computeModule = device.createShaderModule({ code: computeSrc });
+  const renderModule = device.createShaderModule({ code: renderSrc });
+
+  pipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: computeModule, entryPoint: 'main' }
+  });
+
+  renderPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: fmt, blend: {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' },
+      alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+    }}] },
+    primitive: { topology: 'point-list' }
+  });
+
+  uniformBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  // RenderUni: mat4x4f (64) + vec4f info (16) = 80 bytes
+  const mvpBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  window._mvpBuf = mvpBuf;
+
+  // --- Box wireframe ---
+  const boxSrc = `
+@group(0) @binding(0) var<uniform> mvp: mat4x4f;
+struct VSOut { @builtin(position) pos: vec4f }
+@vertex  fn vs(@location(0) p: vec3f) -> VSOut { return VSOut(mvp * vec4f(p, 1.0)); }
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.2, 0.4, 0.8, 0.5); }
+`;
+  const boxModule = device.createShaderModule({ code: boxSrc });
+  const boxPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: boxModule, entryPoint: 'vs',
+      buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+    fragment: { module: boxModule, entryPoint: 'fs', targets: [{ format: fmt, blend: {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+    }}] },
+    primitive: { topology: 'line-list' }
+  });
+
+  // 12 edges of the box [0,BOX_L]^3
+  const L = BOX_L;
+  const corners = [[0,0,0],[L,0,0],[L,L,0],[0,L,0],[0,0,L],[L,0,L],[L,L,L],[0,L,L]];
+  const edges   = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  const boxVerts = new Float32Array(edges.flatMap(([a,b]) => [...corners[a], ...corners[b]]));
+  const boxVertBuf = device.createBuffer({
+    size: boxVerts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(boxVertBuf, 0, boxVerts);
+
+  const boxBindGroup = device.createBindGroup({
+    layout: boxPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: mvpBuf, size: 64 } }]
+  });
+  window._box = { pipeline: boxPipeline, vertBuf: boxVertBuf, bindGroup: boxBindGroup };
+
+  function makeStorageBuf(data) {
+    const buf = device.createBuffer({
+      size: data.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(buf, 0, data);
+    return buf;
+  }
+
+  function setupBuffers(initPos, initVel) {
+    if (posBufferA) { posBufferA.destroy(); posBufferB.destroy(); velBufferA.destroy(); velBufferB.destroy(); }
+    posBufferA = makeStorageBuf(initPos);
+    posBufferB = makeStorageBuf(initPos);
+    velBufferA = makeStorageBuf(initVel);
+    velBufferB = makeStorageBuf(initVel);
+
+    bindGroupA = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: posBufferA } },
+        { binding: 1, resource: { buffer: velBufferA } },
+        { binding: 2, resource: { buffer: posBufferB } },
+        { binding: 3, resource: { buffer: velBufferB } },
+        { binding: 4, resource: { buffer: uniformBuf } },
+      ]
+    });
+    bindGroupB = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: posBufferB } },
+        { binding: 1, resource: { buffer: velBufferB } },
+        { binding: 2, resource: { buffer: posBufferA } },
+        { binding: 3, resource: { buffer: velBufferA } },
+        { binding: 4, resource: { buffer: uniformBuf } },
+      ]
+    });
+
+    renderBindGroupA = device.createBindGroup({
+      layout: renderPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: posBufferA } },
+        { binding: 1, resource: { buffer: mvpBuf } },
+      ]
+    });
+    renderBindGroupB = device.createBindGroup({
+      layout: renderPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: posBufferB } },
+        { binding: 1, resource: { buffer: mvpBuf } },
+      ]
+    });
+  }
+
+  function init() {
+    const { pos, vel } = galaxyPositions();
+    step = 0;
+    simTime = 0;
+    setupBuffers(pos, vel);
+  }
+  window.init = init;
+  init();
+  window._gpuReady = true;
+
+  // Column-major matrix multiply: out = a * b
+  function mat4mul(a, b) {
+    const out = new Float32Array(16);
+    for (let col = 0; col < 4; col++) {
+      for (let row = 0; row < 4; row++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += a[k*4+row] * b[col*4+k];
+        out[col*4+row] = s;
+      }
+    }
+    return out;
+  }
+
+  // WebGPU depth range [0,1], column-major output
+  function perspective(fov, asp, near, far) {
+    const f = 1.0 / Math.tan(fov / 2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+      f/asp, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, far*nf, -1,
+      0, 0, near*far*nf, 0
+    ]);
+  }
+
+  function lookAt(eye, center, up) {
+    const f = norm(sub(center, eye));
+    const s = norm(cross(f, up));
+    const u = cross(s, f);
+    return new Float32Array([
+      s[0], u[0], -f[0], 0,
+      s[1], u[1], -f[1], 0,
+      s[2], u[2], -f[2], 0,
+      -dot(s,eye), -dot(u,eye), dot(f,eye), 1
+    ]);
+  }
+
+  function norm(v) { const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [v[0]/l,v[1]/l,v[2]/l]; }
+  function sub(a,b) { return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; }
+  function cross(a,b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+  function dot(a,b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+  function frame() {
+    const canvas = document.getElementById('c');
+    const asp = canvas.width / canvas.height;
+
+    updateCameraMovement();
+
+    // Update MVP — eye orbits around camTarget
+    const eye = [
+      camTarget[0] + camDist * Math.sin(camPhi) * Math.cos(camTheta),
+      camTarget[1] + camDist * Math.cos(camPhi),
+      camTarget[2] + camDist * Math.sin(camPhi) * Math.sin(camTheta)
+    ];
+    const up = Math.abs(Math.cos(camPhi)) > 0.99 ? [Math.sin(camTheta), 0, -Math.cos(camTheta)] : [0, 1, 0];
+    const view = lookAt(eye, camTarget, up);
+    const proj = perspective(Math.PI/3, asp, 0.1, 500);
+    const mvp = mat4mul(proj, view);
+    device.queue.writeBuffer(window._mvpBuf, 0, mvp);
+    // screen: width, height, star glow radius (px), BH glow radius (px)
+    device.queue.writeBuffer(window._mvpBuf, 64, new Float32Array([0, 0, 0, BOX_L/2]));
+
+    const dt = DT_BASE * speedMult;
+    const stepsPerFrame = paused ? 0 : Math.max(1, Math.min(8, Math.round(speedMult)));
+    simTime += dt * stepsPerFrame;
+    const a = 1.0 + expansionRate * simTime;   // scale factor
+    const G_eff = G / (a * a);                 // gravity weakens as universe expands
+    const H_drag = 2.0 * expansionRate / a;    // Hubble drag: 2*(ȧ/a)
+    device.queue.writeBuffer(uniformBuf, 0, new Float32Array([dt, N, SOFTENING, G_eff, BOX_L, H_drag, 0, 0]));
+
+    const enc = device.createCommandEncoder();
+
+    // Compute steps per frame
+    if (!paused) {
+      for (let s = 0; s < stepsPerFrame; s++) {
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, step % 2 === 0 ? bindGroupA : bindGroupB);
+        pass.dispatchWorkgroups(Math.ceil(N / 256));
+        pass.end();
+        step++;
+      }
+    }
+
+    // Render
+    const view2 = context.getCurrentTexture().createView();
+    const rpass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: view2,
+        clearValue: { r: 0.0, g: 0.0, b: 0.02, a: 1 },
+        loadOp: 'clear', storeOp: 'store'
+      }]
+    });
+    rpass.setPipeline(renderPipeline);
+    rpass.setBindGroup(0, step % 2 === 0 ? renderBindGroupA : renderBindGroupB);
+    rpass.draw(N);
+
+    const box = window._box;
+    rpass.setPipeline(box.pipeline);
+    rpass.setBindGroup(0, box.bindGroup);
+    rpass.setVertexBuffer(0, box.vertBuf);
+    rpass.draw(24);  // 12 edges × 2 verts
+
+    rpass.end();
+
+    device.queue.submit([enc.finish()]);
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+main().catch(e => { document.body.innerHTML = '<pre style="color:red">'+e+'</pre>'; });
+</script>
+</body>
+</html>
