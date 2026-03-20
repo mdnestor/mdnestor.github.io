@@ -181,17 +181,23 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
         @builtin(local_invocation_id)  lid: vec3u) {
   let i = gid.x;
   let Np = u32(params.Nf);
-  if (i >= Np) { return; }
+  let active = i < Np;
 
   let dt    = params.dt;
   let soft2 = params.soft * params.soft;
   let g     = params.G;
   let L     = params.L;
 
-  let pi = inPos[i].xyz;
-  let mi = inPos[i].w;
-  var vi = inVel[i].xyz;
+  var pi = vec3f(0.0);
+  var mi = 0.0;
+  var vi = vec3f(0.0);
   var acc = vec3f(0.0);
+
+  if (active) {
+    pi = inPos[i].xyz;
+    mi = inPos[i].w;
+    vi = inVel[i].xyz;
+  }
 
   let tiles = (Np + 255u) / 256u;
   for (var t = 0u; t < tiles; t++) {
@@ -199,28 +205,30 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
     sharedPos[lid.x] = select(vec4f(0.0), inPos[j], j < Np);
     workgroupBarrier();
 
-    for (var k = 0u; k < 256u; k++) {
-      let pj = sharedPos[k];
-      let mj = pj.w;
-      // Minimum image convention: nearest periodic image
-      var r = pj.xyz - pi;
-      r = r - round(r / L) * L;
-      let dist2 = dot(r, r) + soft2;
-      let inv_dist3 = inverseSqrt(dist2 * dist2 * dist2);
-      acc += r * (g * mj * inv_dist3);
+    if (active) {
+      for (var k = 0u; k < 256u; k++) {
+        let pj = sharedPos[k];
+        let mj = pj.w;
+        var r = pj.xyz - pi;
+        r = r - round(r / L) * L;
+        let dist2 = dot(r, r) + soft2;
+        let inv_dist3 = inverseSqrt(dist2 * dist2 * dist2);
+        acc += r * (g * mj * inv_dist3);
+      }
     }
     workgroupBarrier();
   }
 
-  vi += acc * dt;
-  vi *= (1.0 - params.Hdrag * dt);  // Hubble drag: damps peculiar velocities
+  if (active) {
+    vi += acc * dt;
+    vi *= (1.0 - params.Hdrag * dt);
 
-  // Wrap position into [0, L]
-  var np = pi + vi * dt;
-  np = np - floor(np / L) * L;
+    var np = pi + vi * dt;
+    np = np - floor(np / L) * L;
 
-  outVel[i] = vec4f(vi, mi);
-  outPos[i] = vec4f(np, mi);
+    outVel[i] = vec4f(vi, mi);
+    outPos[i] = vec4f(np, mi);
+  }
 }
 `;
 
