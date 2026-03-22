@@ -5,7 +5,7 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; overflow: hidden; font-family: monospace; color: #fff; }
-canvas { display: block; }
+canvas { display: block; position: absolute; top: 0; left: 0; }
 #ui {
   position: fixed; top: 10px; left: 10px;
   background: rgba(0,0,0,0.6); padding: 10px; border: 1px solid #333;
@@ -15,12 +15,19 @@ canvas { display: block; }
 #ui button:hover { background: #444; }
 #speed-val { display: inline-block; width: 40px; text-align: center; }
 #ui input[type=range] { width: 110px; vertical-align: middle; cursor: pointer; direction: ltr; accent-color: #4488ff; }
+#ui label { cursor: pointer; }
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<canvas id="c2d"></canvas>
+<canvas id="cgpu" style="display:none"></canvas>
 <div id="ui">
-  <div>N-body sim | WebGPU</div>
+  <div>N-body sim | <span id="mode-label">CPU</span></div>
+  <div style="margin-top:6px">
+    <label><input type="checkbox" id="gpu-toggle"> GPU (WebGPU)</label>
+    &nbsp;
+    <label><input type="checkbox" id="dim-toggle"> 3D</label>
+  </div>
   <div style="margin-top:6px">
     <button onclick="changeSpeed(-1)">-</button>
     <span id="speed-val">1x</span>
@@ -28,8 +35,8 @@ canvas { display: block; }
     &nbsp;Speed
   </div>
   <div style="margin-top:6px">
-    <button onclick="changeN(-1)">½</button>
-    <button onclick="changeN(1)">×2</button>
+    <button onclick="changeN(-1)">&half;</button>
+    <button onclick="changeN(1)">&times;2</button>
     <span id="n-val"></span> bodies
   </div>
   <div style="margin-top:4px">
@@ -37,21 +44,27 @@ canvas { display: block; }
     H=<span id="exp-val">0.00</span>
   </div>
   <div style="margin-top:4px; color:#888; font-size:11px">
-    SPACE=pause R=reset<br>Drag=rotate Wheel=zoom<br>WASD=pan Shift=up Ctrl=down
+    SPACE=pause R=reset<br>
+    <span id="controls-hint-3d" style="display:none">Drag=rotate Wheel=zoom<br>WASD=pan Shift=up Ctrl=down</span>
+    <span id="controls-hint-2d">Drag=pan Wheel=zoom</span>
   </div>
 </div>
 <script>
-let N = 32768;
+let N = 1024;
 const DT_BASE = 0.003;
 const SOFTENING = 0.04;
 const G = 1.0;
-const BOX_L = 4.0;   // periodic box side length
-const M_STAR = 1.0 / N;
+const BOX_L = 4.0;
+let M_STAR = 1.0 / N;
 
 let speedMult = 1;
 let paused = false;
 let speedLevels = [0.1, 0.25, 0.5, 1, 2, 4, 8, 16];
 let speedIdx = 3;
+
+let useGPU = false;
+let use3D = false;
+let gpuAvailable = false;
 
 function changeSpeed(d) {
   speedIdx = Math.max(0, Math.min(speedLevels.length - 1, speedIdx + d));
@@ -59,32 +72,27 @@ function changeSpeed(d) {
   document.getElementById('speed-val').textContent = speedMult + 'x';
 }
 
-// N slider: log2 scale (value = log2(N))
 function changeN(dir) {
-  const MIN_N = 512, MAX_N = 1 << 19; // 512 to 524288
+  const MIN_N = 128, MAX_N = useGPU ? (1 << 19) : (1 << 14);
   const next = dir > 0 ? N * 2 : N / 2;
   if (next < MIN_N || next > MAX_N) return;
   N = next;
+  M_STAR = 1.0 / N;
   document.getElementById('n-val').textContent = N.toLocaleString();
-  if (window._gpuReady) init();
+  init();
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('n-val').textContent = N.toLocaleString();
-
-  document.getElementById('exp-slider').addEventListener('input', e => {
-    expansionRate = parseInt(e.target.value) / 100 * 1.0;
-    document.getElementById('exp-val').textContent = expansionRate.toFixed(2);
-  });
-});
-
-// Expansion: G_eff = G / (1 + H*t)^2  — equivalent to distances growing as a(t) = 1 + H*t
+// Expansion
 let expansionRate = 0.0;
 let simTime = 0.0;
 
-// Camera
+// Camera (3D)
 let camTheta = 0.6, camPhi = 0.9, camDist = 7.0;
 let camTarget = [BOX_L/2, BOX_L/2, BOX_L/2];
+
+// Camera (2D)
+let cam2DX = BOX_L/2, cam2DY = BOX_L/2, cam2DZoom = 1.0;
+
 let mouseDown = false, lastMX = 0, lastMY = 0;
 const keys = {};
 
@@ -95,29 +103,52 @@ window.addEventListener('mousedown', e => {
 window.addEventListener('mouseup', () => mouseDown = false);
 window.addEventListener('mousemove', e => {
   if (!mouseDown) return;
-  camTheta -= (e.clientX - lastMX) * 0.005;
-  camPhi = Math.max(0.05, Math.min(Math.PI - 0.05, camPhi + (e.clientY - lastMY) * 0.005));
+  const dx = e.clientX - lastMX, dy = e.clientY - lastMY;
   lastMX = e.clientX; lastMY = e.clientY;
+  if (use3D) {
+    camTheta -= dx * 0.005;
+    camPhi = Math.max(0.05, Math.min(Math.PI - 0.05, camPhi + dy * 0.005));
+  } else {
+    const scale = BOX_L / (Math.min(window.innerWidth, window.innerHeight) * cam2DZoom);
+    cam2DX -= dx * scale;
+    cam2DY -= dy * scale;
+  }
 });
-window.addEventListener('wheel', e => { camDist *= 1 + e.deltaY * 0.001; camDist = Math.max(0.1, Math.min(50, camDist)); });
+window.addEventListener('wheel', e => {
+  if (use3D) {
+    camDist *= 1 + e.deltaY * 0.001;
+    camDist = Math.max(0.1, Math.min(50, camDist));
+  } else {
+    cam2DZoom *= 1 - e.deltaY * 0.001;
+    cam2DZoom = Math.max(0.1, Math.min(20, cam2DZoom));
+  }
+});
 window.addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
-  if (e.code === 'KeyR') { camTarget = [BOX_L/2, BOX_L/2, BOX_L/2]; init(); }
+  if (e.code === 'KeyR') {
+    camTarget = [BOX_L/2, BOX_L/2, BOX_L/2];
+    cam2DX = BOX_L/2; cam2DY = BOX_L/2; cam2DZoom = 1.0;
+    init();
+  }
   if (['KeyW','KeyA','KeyS','KeyD','ShiftLeft','ShiftRight','ControlLeft','ControlRight'].includes(e.code)) e.preventDefault();
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
 function updateCameraMovement() {
+  if (!use3D) {
+    const speed = BOX_L * 0.02 / cam2DZoom;
+    if (keys['KeyW']) cam2DY -= speed;
+    if (keys['KeyS']) cam2DY += speed;
+    if (keys['KeyA']) cam2DX -= speed;
+    if (keys['KeyD']) cam2DX += speed;
+    return;
+  }
   const sP = Math.sin(camPhi), cP = Math.cos(camPhi);
   const sT = Math.sin(camTheta), cT = Math.cos(camTheta);
-  // Forward = direction from eye toward target
   const fw = [-sP*cT, -cP, -sP*sT];
-  // Right = cross(forward, worldUp), always horizontal
   const rt = [sT, 0, -cT];
-  // Camera up = cross(right, forward)
   const cu = [rt[1]*fw[2]-rt[2]*fw[1], rt[2]*fw[0]-rt[0]*fw[2], rt[0]*fw[1]-rt[1]*fw[0]];
-
   const speed = camDist * 0.02;
   const move = (v, s) => { camTarget[0]+=v[0]*s; camTarget[1]+=v[1]*s; camTarget[2]+=v[2]*s; };
   if (keys['KeyW']) move(fw,  speed);
@@ -128,44 +159,257 @@ function updateCameraMovement() {
   if (keys['ControlLeft']||keys['ControlRight']) move(cu, -speed);
 }
 
-// Random init in periodic box [0, BOX_L]^3
+// CPU state
+let cpuPos, cpuVel;
+
 function galaxyPositions() {
   const pos = new Float32Array(N * 4);
   const vel = new Float32Array(N * 4);
-  const sigma = 0.15;  // initial velocity dispersion
+  const sigma = 0.15;
   for (let i = 0; i < N; i++) {
     pos[i*4+0] = Math.random() * BOX_L;
     pos[i*4+1] = Math.random() * BOX_L;
-    pos[i*4+2] = Math.random() * BOX_L;
+    pos[i*4+2] = use3D ? Math.random() * BOX_L : BOX_L / 2;
     pos[i*4+3] = M_STAR;
     vel[i*4+0] = (Math.random()-0.5) * sigma;
     vel[i*4+1] = (Math.random()-0.5) * sigma;
-    vel[i*4+2] = (Math.random()-0.5) * sigma;
+    vel[i*4+2] = use3D ? (Math.random()-0.5) * sigma : 0;
     vel[i*4+3] = 0;
   }
   return { pos, vel };
 }
 
-let device, context, pipeline, renderPipeline;
+// ---- CPU Physics (Web Workers) ----
+const WORKER_SRC = `
+self.onmessage = function(e) {
+  const d = e.data;
+  const allPos = d.allPos, velChunk = d.velChunk;
+  const start = d.start, end = d.end, N = d.N;
+  const dt = d.dt, G_eff = d.G_eff, H_drag = d.H_drag;
+  const soft2 = d.soft * d.soft, L = d.L, is3D = d.is3D;
+  const count = end - start;
+
+  // Compute forces and update velocities for our chunk
+  for (let i = start; i < end; i++) {
+    let ax = 0, ay = 0, az = 0;
+    const px = allPos[i*4], py = allPos[i*4+1], pz = allPos[i*4+2];
+    for (let j = 0; j < N; j++) {
+      let rx = allPos[j*4] - px;
+      let ry = allPos[j*4+1] - py;
+      let rz = is3D ? allPos[j*4+2] - pz : 0;
+      rx -= Math.round(rx / L) * L;
+      ry -= Math.round(ry / L) * L;
+      if (is3D) rz -= Math.round(rz / L) * L;
+      const dist2 = rx*rx + ry*ry + rz*rz + soft2;
+      const inv3 = 1.0 / (dist2 * Math.sqrt(dist2));
+      const mj = allPos[j*4+3];
+      ax += rx * G_eff * mj * inv3;
+      ay += ry * G_eff * mj * inv3;
+      if (is3D) az += rz * G_eff * mj * inv3;
+    }
+    const li = (i - start) * 4;
+    velChunk[li]   = (velChunk[li]   + ax * dt) * (1 - H_drag * dt);
+    velChunk[li+1] = (velChunk[li+1] + ay * dt) * (1 - H_drag * dt);
+    if (is3D) velChunk[li+2] = (velChunk[li+2] + az * dt) * (1 - H_drag * dt);
+  }
+
+  // Update positions for our chunk
+  const posChunk = new Float32Array(count * 4);
+  for (let i = start; i < end; i++) {
+    const li = (i - start) * 4;
+    let nx = allPos[i*4]   + velChunk[li]   * dt;
+    let ny = allPos[i*4+1] + velChunk[li+1] * dt;
+    let nz = is3D ? allPos[i*4+2] + velChunk[li+2] * dt : allPos[i*4+2];
+    posChunk[li]   = nx - Math.floor(nx / L) * L;
+    posChunk[li+1] = ny - Math.floor(ny / L) * L;
+    posChunk[li+2] = is3D ? nz - Math.floor(nz / L) * L : nz;
+    posChunk[li+3] = allPos[i*4+3];
+  }
+
+  self.postMessage({ start, end, posChunk, velChunk }, [posChunk.buffer, velChunk.buffer]);
+};
+`;
+
+let workerPool = [];
+let numWorkers = 0;
+let computePending = false;
+
+function initWorkers() {
+  workerPool.forEach(w => w.terminate());
+  workerPool = [];
+  const cores = navigator.hardwareConcurrency || 4;
+  numWorkers = Math.max(1, Math.min(cores - 1, Math.floor(N / 64)));
+  const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  for (let i = 0; i < numWorkers; i++) workerPool.push(new Worker(url));
+  URL.revokeObjectURL(url);
+}
+
+function cpuStepWorkers(dt, G_eff, H_drag) {
+  return new Promise(resolve => {
+    let completed = 0;
+    const chunkSize = Math.ceil(N / numWorkers);
+    for (let i = 0; i < numWorkers; i++) {
+      const start = i * chunkSize;
+      const end = Math.min(start + chunkSize, N);
+      if (start >= end) { completed++; if (completed === numWorkers) resolve(); continue; }
+      const velChunk = cpuVel.slice(start * 4, end * 4);
+      workerPool[i].onmessage = (e) => {
+        const r = e.data;
+        cpuPos.set(r.posChunk, r.start * 4);
+        cpuVel.set(r.velChunk, r.start * 4);
+        completed++;
+        if (completed === numWorkers) resolve();
+      };
+      workerPool[i].postMessage({
+        allPos: cpuPos, velChunk,
+        start, end, N, dt, G_eff, H_drag,
+        soft: SOFTENING, L: BOX_L, is3D: use3D
+      }, [velChunk.buffer]);
+    }
+  });
+}
+
+async function runWorkerSteps(count, dt, G_eff, H_drag) {
+  for (let s = 0; s < count; s++) await cpuStepWorkers(dt, G_eff, H_drag);
+}
+
+// ---- Canvas2D Rendering ----
+function renderCPU2D(ctx, w, h) {
+  ctx.fillStyle = 'rgba(0, 0, 5, 1)';
+  ctx.fillRect(0, 0, w, h);
+
+  const scale = Math.min(w, h) * cam2DZoom / BOX_L;
+  const ox = w/2 - cam2DX * scale;
+  const oy = h/2 - cam2DY * scale;
+
+  // Draw box
+  ctx.strokeStyle = 'rgba(51, 102, 204, 0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(ox, oy, BOX_L * scale, BOX_L * scale);
+
+  // Draw particles
+  const half = BOX_L / 2;
+  for (let i = 0; i < N; i++) {
+    const x = cpuPos[i*4];
+    const y = cpuPos[i*4+1];
+    const sx = ox + x * scale;
+    const sy = oy + y * scale;
+    if (sx < -2 || sx > w+2 || sy < -2 || sy > h+2) continue;
+    const d = Math.sqrt((x-half)*(x-half) + (y-half)*(y-half)) / half;
+    const t = Math.min(d, 1);
+    const r = Math.floor(140 + t * 115);
+    const g = Math.floor(191 + t * 64);
+    ctx.fillStyle = `rgb(${r},${g},255)`;
+    ctx.fillRect(sx, sy, 1.5, 1.5);
+  }
+}
+
+function renderCPU3D(ctx, w, h) {
+  ctx.fillStyle = 'rgba(0, 0, 5, 1)';
+  ctx.fillRect(0, 0, w, h);
+
+  const asp = w / h;
+  const eye = [
+    camTarget[0] + camDist * Math.sin(camPhi) * Math.cos(camTheta),
+    camTarget[1] + camDist * Math.cos(camPhi),
+    camTarget[2] + camDist * Math.sin(camPhi) * Math.sin(camTheta)
+  ];
+  const up = Math.abs(Math.cos(camPhi)) > 0.99 ? [Math.sin(camTheta), 0, -Math.cos(camTheta)] : [0, 1, 0];
+  const mvp = mat4mul(perspective(Math.PI/3, asp, 0.1, 500), lookAt(eye, camTarget, up));
+
+  // Project and draw box edges
+  const L = BOX_L;
+  const corners = [[0,0,0],[L,0,0],[L,L,0],[0,L,0],[0,0,L],[L,0,L],[L,L,L],[0,L,L]];
+  const edges = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  ctx.strokeStyle = 'rgba(51, 102, 204, 0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [a, b] of edges) {
+    const pa = project(corners[a], mvp, w, h);
+    const pb = project(corners[b], mvp, w, h);
+    if (pa && pb) { ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); }
+  }
+  ctx.stroke();
+
+  // Draw particles
+  const half = BOX_L / 2;
+  for (let i = 0; i < N; i++) {
+    const x = cpuPos[i*4], y = cpuPos[i*4+1], z = cpuPos[i*4+2];
+    const sp = project([x, y, z], mvp, w, h);
+    if (!sp) continue;
+    const d = Math.sqrt((x-half)*(x-half) + (y-half)*(y-half) + (z-half)*(z-half)) / half;
+    const t = Math.min(d, 1);
+    const r = Math.floor(140 + t * 115);
+    const g = Math.floor(191 + t * 64);
+    ctx.fillStyle = `rgb(${r},${g},255)`;
+    ctx.fillRect(sp[0], sp[1], 1.5, 1.5);
+  }
+}
+
+function project(p, mvp, w, h) {
+  const x = mvp[0]*p[0] + mvp[4]*p[1] + mvp[8]*p[2] + mvp[12];
+  const y = mvp[1]*p[0] + mvp[5]*p[1] + mvp[9]*p[2] + mvp[13];
+  const ww = mvp[3]*p[0] + mvp[7]*p[1] + mvp[11]*p[2] + mvp[15];
+  if (ww <= 0.01) return null;
+  return [(x/ww * 0.5 + 0.5) * w, (1 - (y/ww * 0.5 + 0.5)) * h];
+}
+
+// ---- Matrix helpers (shared by CPU3D renderer and GPU path) ----
+function mat4mul(a, b) {
+  const out = new Float32Array(16);
+  for (let col = 0; col < 4; col++)
+    for (let row = 0; row < 4; row++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k*4+row] * b[col*4+k];
+      out[col*4+row] = s;
+    }
+  return out;
+}
+function perspective(fov, asp, near, far) {
+  const f = 1.0 / Math.tan(fov / 2), nf = 1 / (near - far);
+  return new Float32Array([f/asp,0,0,0, 0,f,0,0, 0,0,far*nf,-1, 0,0,near*far*nf,0]);
+}
+function lookAt(eye, center, up) {
+  const f = vnorm(vsub(center, eye));
+  const s = vnorm(vcross(f, up));
+  const u = vcross(s, f);
+  return new Float32Array([
+    s[0],u[0],-f[0],0, s[1],u[1],-f[1],0, s[2],u[2],-f[2],0,
+    -vdot(s,eye),-vdot(u,eye),vdot(f,eye),1
+  ]);
+}
+function vnorm(v) { const l=Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [v[0]/l,v[1]/l,v[2]/l]; }
+function vsub(a,b) { return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; }
+function vcross(a,b) { return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]; }
+function vdot(a,b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+// ---- WebGPU state ----
+let device, gpuContext, gpuPipeline, gpuRenderPipeline;
 let posBufferA, posBufferB, velBufferA, velBufferB;
 let uniformBuf, bindGroupA, bindGroupB;
 let renderBindGroupA, renderBindGroupB;
-let step = 0;
+let gpuStep = 0;
+let gpuMvpBuf, gpuBoxPipeline, gpuBoxVertBuf, gpuBoxBindGroup;
+let gpuCanvasFormat;
 
-async function main() {
-  const canvas = document.getElementById('c');
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-  window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; });
+async function initGPU() {
+  if (!navigator.gpu) return false;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return false;
+    device = await adapter.requestDevice();
+    gpuCanvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    return true;
+  } catch(e) { return false; }
+}
 
-  if (!navigator.gpu) { alert('WebGPU not supported!'); return; }
-  const adapter = await navigator.gpu.requestAdapter();
-  device = await adapter.requestDevice();
-  context = canvas.getContext('webgpu');
-  const fmt = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format: fmt, alphaMode: 'opaque' });
+function setupGPUContext(canvas) {
+  gpuContext = canvas.getContext('webgpu');
+  configureGPUContext();
+}
 
-  // Compute shader — O(N²) tiled, periodic boundary (minimum image convention)
+function createGPUPipelines() {
   const computeSrc = `
 struct Params { dt:f32, Nf:f32, soft:f32, G:f32, L:f32, Hdrag:f32, _b:f32, _c:f32 }
 @group(0) @binding(0) var<storage, read>       inPos:  array<vec4f>;
@@ -182,7 +426,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
   let i = gid.x;
   let Np = u32(params.Nf);
   let alive = i < Np;
-
   let dt    = params.dt;
   let soft2 = params.soft * params.soft;
   let g     = params.G;
@@ -204,7 +447,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
     let j = t * 256u + lid.x;
     sharedPos[lid.x] = select(vec4f(0.0), inPos[j], j < Np);
     workgroupBarrier();
-
     if (alive) {
       for (var k = 0u; k < 256u; k++) {
         let pj = sharedPos[k];
@@ -222,51 +464,43 @@ fn main(@builtin(global_invocation_id) gid: vec3u,
   if (alive) {
     vi += acc * dt;
     vi *= (1.0 - params.Hdrag * dt);
-
     var np = pi + vi * dt;
     np = np - floor(np / L) * L;
-
     outVel[i] = vec4f(vi, mi);
     outPos[i] = vec4f(np, mi);
   }
-}
-`;
+}`;
 
-  // Render shader — one point per particle
   const renderSrc = `
-struct RenderUni { mvp: mat4x4f, info: vec4f }  // info.w = BOX_L/2
+struct RenderUni { mvp: mat4x4f, info: vec4f }
 @group(0) @binding(0) var<storage, read> positions: array<vec4f>;
 @group(0) @binding(1) var<uniform> uni: RenderUni;
-
 struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f }
-
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
   var out: VSOut;
-  let p    = positions[vi];
-  out.pos  = uni.mvp * vec4f(p.xyz, 1.0);
+  let p = positions[vi];
+  out.pos = uni.mvp * vec4f(p.xyz, 1.0);
   let half = uni.info.w;
-  let t    = clamp(length(p.xyz - vec3f(half)) / half, 0.0, 1.0);
-  out.col  = vec4f(0.55 + t*0.45, 0.75 + t*0.25, 1.0, 1.0);
+  let t = clamp(length(p.xyz - vec3f(half)) / half, 0.0, 1.0);
+  out.col = vec4f(0.55 + t*0.45, 0.75 + t*0.25, 1.0, 1.0);
   return out;
 }
-
 @fragment
-fn fs(in: VSOut) -> @location(0) vec4f { return in.col; }
-`;
+fn fs(in: VSOut) -> @location(0) vec4f { return in.col; }`;
 
   const computeModule = device.createShaderModule({ code: computeSrc });
   const renderModule = device.createShaderModule({ code: renderSrc });
 
-  pipeline = device.createComputePipeline({
+  gpuPipeline = device.createComputePipeline({
     layout: 'auto',
     compute: { module: computeModule, entryPoint: 'main' }
   });
 
-  renderPipeline = device.createRenderPipeline({
+  gpuRenderPipeline = device.createRenderPipeline({
     layout: 'auto',
     vertex: { module: renderModule, entryPoint: 'vs' },
-    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: fmt, blend: {
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: gpuCanvasFormat, blend: {
       color: { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' },
       alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
     }}] },
@@ -274,220 +508,288 @@ fn fs(in: VSOut) -> @location(0) vec4f { return in.col; }
   });
 
   uniformBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  gpuMvpBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-  // RenderUni: mat4x4f (64) + vec4f info (16) = 80 bytes
-  const mvpBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  window._mvpBuf = mvpBuf;
-
-  // --- Box wireframe ---
+  // Box wireframe pipeline
   const boxSrc = `
 @group(0) @binding(0) var<uniform> mvp: mat4x4f;
 struct VSOut { @builtin(position) pos: vec4f }
-@vertex  fn vs(@location(0) p: vec3f) -> VSOut { return VSOut(mvp * vec4f(p, 1.0)); }
-@fragment fn fs() -> @location(0) vec4f { return vec4f(0.2, 0.4, 0.8, 0.5); }
-`;
+@vertex fn vs(@location(0) p: vec3f) -> VSOut { return VSOut(mvp * vec4f(p, 1.0)); }
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.2, 0.4, 0.8, 0.5); }`;
   const boxModule = device.createShaderModule({ code: boxSrc });
-  const boxPipeline = device.createRenderPipeline({
+  gpuBoxPipeline = device.createRenderPipeline({
     layout: 'auto',
     vertex: { module: boxModule, entryPoint: 'vs',
       buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
-    fragment: { module: boxModule, entryPoint: 'fs', targets: [{ format: fmt, blend: {
+    fragment: { module: boxModule, entryPoint: 'fs', targets: [{ format: gpuCanvasFormat, blend: {
       color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
       alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
     }}] },
     primitive: { topology: 'line-list' }
   });
 
-  // 12 edges of the box [0,BOX_L]^3
   const L = BOX_L;
   const corners = [[0,0,0],[L,0,0],[L,L,0],[0,L,0],[0,0,L],[L,0,L],[L,L,L],[0,L,L]];
-  const edges   = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  const edges = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
   const boxVerts = new Float32Array(edges.flatMap(([a,b]) => [...corners[a], ...corners[b]]));
-  const boxVertBuf = device.createBuffer({
-    size: boxVerts.byteLength,
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+  gpuBoxVertBuf = device.createBuffer({ size: boxVerts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(gpuBoxVertBuf, 0, boxVerts);
+  gpuBoxBindGroup = device.createBindGroup({
+    layout: gpuBoxPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: gpuMvpBuf, size: 64 } }]
   });
-  device.queue.writeBuffer(boxVertBuf, 0, boxVerts);
+}
 
-  const boxBindGroup = device.createBindGroup({
-    layout: boxPipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: mvpBuf, size: 64 } }]
+function makeStorageBuf(data) {
+  const buf = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
-  window._box = { pipeline: boxPipeline, vertBuf: boxVertBuf, bindGroup: boxBindGroup };
+  device.queue.writeBuffer(buf, 0, data);
+  return buf;
+}
 
-  function makeStorageBuf(data) {
-    const buf = device.createBuffer({
-      size: data.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(buf, 0, data);
-    return buf;
+function setupGPUBuffers(pos, vel) {
+  if (posBufferA) { posBufferA.destroy(); posBufferB.destroy(); velBufferA.destroy(); velBufferB.destroy(); }
+  posBufferA = makeStorageBuf(pos);
+  posBufferB = makeStorageBuf(pos);
+  velBufferA = makeStorageBuf(vel);
+  velBufferB = makeStorageBuf(vel);
+
+  bindGroupA = device.createBindGroup({
+    layout: gpuPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: posBufferA } },
+      { binding: 1, resource: { buffer: velBufferA } },
+      { binding: 2, resource: { buffer: posBufferB } },
+      { binding: 3, resource: { buffer: velBufferB } },
+      { binding: 4, resource: { buffer: uniformBuf } },
+    ]
+  });
+  bindGroupB = device.createBindGroup({
+    layout: gpuPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: posBufferB } },
+      { binding: 1, resource: { buffer: velBufferB } },
+      { binding: 2, resource: { buffer: posBufferA } },
+      { binding: 3, resource: { buffer: velBufferA } },
+      { binding: 4, resource: { buffer: uniformBuf } },
+    ]
+  });
+  renderBindGroupA = device.createBindGroup({
+    layout: gpuRenderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: posBufferA } },
+      { binding: 1, resource: { buffer: gpuMvpBuf } },
+    ]
+  });
+  renderBindGroupB = device.createBindGroup({
+    layout: gpuRenderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: posBufferB } },
+      { binding: 1, resource: { buffer: gpuMvpBuf } },
+    ]
+  });
+}
+
+function init() {
+  const { pos, vel } = galaxyPositions();
+  cpuPos = new Float32Array(pos);
+  cpuVel = new Float32Array(vel);
+  simTime = 0;
+  gpuStep = 0;
+  computePending = false;
+  initWorkers();
+  if (useGPU && device) setupGPUBuffers(pos, vel);
+}
+window.init = init;
+
+function updateModeLabel() {
+  const label = (useGPU ? 'WebGPU' : 'CPU\u00d7' + numWorkers) + ' | ' + (use3D ? '3D' : '2D');
+  document.getElementById('mode-label').textContent = label;
+  document.getElementById('controls-hint-3d').style.display = use3D ? '' : 'none';
+  document.getElementById('controls-hint-2d').style.display = use3D ? 'none' : '';
+}
+
+// ---- Canvas management ----
+// Browsers lock a canvas to its first context type, so we use two canvases:
+// one for Canvas2D (CPU mode), one for WebGPU (GPU mode), and show/hide.
+const canvas2D = document.getElementById('c2d');
+const canvasGPU = document.getElementById('cgpu');
+let ctx2d = null;
+let gpuPipelinesReady = false;
+
+function configureGPUContext() {
+  if (gpuContext && device) {
+    gpuContext.configure({ device, format: gpuCanvasFormat, alphaMode: 'opaque' });
+  }
+}
+
+function showCanvas(gpu) {
+  canvas2D.style.display = gpu ? 'none' : 'block';
+  canvasGPU.style.display = gpu ? 'block' : 'none';
+  if (gpu) configureGPUContext();
+}
+
+function resizeCanvases() {
+  // Setting width/height unconfigures any WebGPU context, so reconfigure after
+  canvas2D.width = canvasGPU.width = window.innerWidth;
+  canvas2D.height = canvasGPU.height = window.innerHeight;
+  if (useGPU) configureGPUContext();
+}
+
+// ---- Main ----
+async function main() {
+  resizeCanvases();
+  window.addEventListener('resize', resizeCanvases);
+
+  document.getElementById('n-val').textContent = N.toLocaleString();
+  document.getElementById('exp-slider').addEventListener('input', e => {
+    expansionRate = parseInt(e.target.value) / 100 * 1.0;
+    document.getElementById('exp-val').textContent = expansionRate.toFixed(2);
+  });
+
+  // Set up CPU canvas (always available)
+  ctx2d = canvas2D.getContext('2d');
+
+  // Probe GPU and set up GPU canvas if available
+  gpuAvailable = await initGPU();
+  const gpuToggle = document.getElementById('gpu-toggle');
+  const dimToggle = document.getElementById('dim-toggle');
+
+  if (gpuAvailable) {
+    setupGPUContext(canvasGPU);
+    createGPUPipelines();
+    gpuPipelinesReady = true;
+  } else {
+    gpuToggle.disabled = true;
+    gpuToggle.parentElement.style.color = '#666';
+    gpuToggle.parentElement.title = 'WebGPU not available';
   }
 
-  function setupBuffers(initPos, initVel) {
-    if (posBufferA) { posBufferA.destroy(); posBufferB.destroy(); velBufferA.destroy(); velBufferB.destroy(); }
-    posBufferA = makeStorageBuf(initPos);
-    posBufferB = makeStorageBuf(initPos);
-    velBufferA = makeStorageBuf(initVel);
-    velBufferB = makeStorageBuf(initVel);
+  gpuToggle.addEventListener('change', () => {
+    if (!gpuAvailable) { gpuToggle.checked = false; return; }
+    useGPU = gpuToggle.checked;
+    showCanvas(useGPU);
+    updateModeLabel();
+    init();
+  });
 
-    bindGroupA = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: posBufferA } },
-        { binding: 1, resource: { buffer: velBufferA } },
-        { binding: 2, resource: { buffer: posBufferB } },
-        { binding: 3, resource: { buffer: velBufferB } },
-        { binding: 4, resource: { buffer: uniformBuf } },
-      ]
-    });
-    bindGroupB = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: posBufferB } },
-        { binding: 1, resource: { buffer: velBufferB } },
-        { binding: 2, resource: { buffer: posBufferA } },
-        { binding: 3, resource: { buffer: velBufferA } },
-        { binding: 4, resource: { buffer: uniformBuf } },
-      ]
-    });
+  dimToggle.addEventListener('change', () => {
+    use3D = dimToggle.checked;
+    updateModeLabel();
+    init();
+  });
 
-    renderBindGroupA = device.createBindGroup({
-      layout: renderPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: posBufferA } },
-        { binding: 1, resource: { buffer: mvpBuf } },
-      ]
-    });
-    renderBindGroupB = device.createBindGroup({
-      layout: renderPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: posBufferB } },
-        { binding: 1, resource: { buffer: mvpBuf } },
-      ]
-    });
-  }
-
-  function init() {
-    const { pos, vel } = galaxyPositions();
-    step = 0;
-    simTime = 0;
-    setupBuffers(pos, vel);
-  }
-  window.init = init;
+  updateModeLabel();
+  showCanvas(false);
   init();
-  window._gpuReady = true;
-
-  // Column-major matrix multiply: out = a * b
-  function mat4mul(a, b) {
-    const out = new Float32Array(16);
-    for (let col = 0; col < 4; col++) {
-      for (let row = 0; row < 4; row++) {
-        let s = 0;
-        for (let k = 0; k < 4; k++) s += a[k*4+row] * b[col*4+k];
-        out[col*4+row] = s;
-      }
-    }
-    return out;
-  }
-
-  // WebGPU depth range [0,1], column-major output
-  function perspective(fov, asp, near, far) {
-    const f = 1.0 / Math.tan(fov / 2);
-    const nf = 1 / (near - far);
-    return new Float32Array([
-      f/asp, 0, 0, 0,
-      0, f, 0, 0,
-      0, 0, far*nf, -1,
-      0, 0, near*far*nf, 0
-    ]);
-  }
-
-  function lookAt(eye, center, up) {
-    const f = norm(sub(center, eye));
-    const s = norm(cross(f, up));
-    const u = cross(s, f);
-    return new Float32Array([
-      s[0], u[0], -f[0], 0,
-      s[1], u[1], -f[1], 0,
-      s[2], u[2], -f[2], 0,
-      -dot(s,eye), -dot(u,eye), dot(f,eye), 1
-    ]);
-  }
-
-  function norm(v) { const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [v[0]/l,v[1]/l,v[2]/l]; }
-  function sub(a,b) { return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; }
-  function cross(a,b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
-  function dot(a,b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
 
   function frame() {
-    const canvas = document.getElementById('c');
-    const asp = canvas.width / canvas.height;
-
+    const canvas = useGPU ? canvasGPU : canvas2D;
+    const w = canvas.width, h = canvas.height;
     updateCameraMovement();
-
-    // Update MVP — eye orbits around camTarget
-    const eye = [
-      camTarget[0] + camDist * Math.sin(camPhi) * Math.cos(camTheta),
-      camTarget[1] + camDist * Math.cos(camPhi),
-      camTarget[2] + camDist * Math.sin(camPhi) * Math.sin(camTheta)
-    ];
-    const up = Math.abs(Math.cos(camPhi)) > 0.99 ? [Math.sin(camTheta), 0, -Math.cos(camTheta)] : [0, 1, 0];
-    const view = lookAt(eye, camTarget, up);
-    const proj = perspective(Math.PI/3, asp, 0.1, 500);
-    const mvp = mat4mul(proj, view);
-    device.queue.writeBuffer(window._mvpBuf, 0, mvp);
-    // screen: width, height, star glow radius (px), BH glow radius (px)
-    device.queue.writeBuffer(window._mvpBuf, 64, new Float32Array([0, 0, 0, BOX_L/2]));
 
     const dt = DT_BASE * speedMult;
     const stepsPerFrame = paused ? 0 : Math.max(1, Math.min(8, Math.round(speedMult)));
-    simTime += dt * stepsPerFrame;
-    const a = 1.0 + expansionRate * simTime;   // scale factor
-    const G_eff = G / (a * a);                 // gravity weakens as universe expands
-    const H_drag = 2.0 * expansionRate / a;    // Hubble drag: 2*(ȧ/a)
-    device.queue.writeBuffer(uniformBuf, 0, new Float32Array([dt, N, SOFTENING, G_eff, BOX_L, H_drag, 0, 0]));
 
-    const enc = device.createCommandEncoder();
+    if (useGPU && device && gpuContext) {
+      // --- GPU path ---
+      simTime += dt * stepsPerFrame;
+      const a = 1.0 + expansionRate * simTime;
+      const G_eff = G / (a * a);
+      const H_drag = 2.0 * expansionRate / a;
+      device.queue.writeBuffer(uniformBuf, 0, new Float32Array([dt, N, SOFTENING, G_eff, BOX_L, H_drag, 0, 0]));
 
-    // Compute steps per frame
-    if (!paused) {
-      for (let s = 0; s < stepsPerFrame; s++) {
-        const pass = enc.beginComputePass();
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, step % 2 === 0 ? bindGroupA : bindGroupB);
-        pass.dispatchWorkgroups(Math.ceil(N / 256));
-        pass.end();
-        step++;
+      // MVP
+      const asp = w / h;
+      let mvp;
+      if (use3D) {
+        const eye = [
+          camTarget[0] + camDist * Math.sin(camPhi) * Math.cos(camTheta),
+          camTarget[1] + camDist * Math.cos(camPhi),
+          camTarget[2] + camDist * Math.sin(camPhi) * Math.sin(camTheta)
+        ];
+        const up = Math.abs(Math.cos(camPhi)) > 0.99 ? [Math.sin(camTheta), 0, -Math.cos(camTheta)] : [0, 1, 0];
+        mvp = mat4mul(perspective(Math.PI/3, asp, 0.1, 500), lookAt(eye, camTarget, up));
+      } else {
+        // Orthographic-like view from above for 2D
+        mvp = ortho2DMVP(w, h);
+      }
+      device.queue.writeBuffer(gpuMvpBuf, 0, mvp);
+      device.queue.writeBuffer(gpuMvpBuf, 64, new Float32Array([0, 0, 0, BOX_L/2]));
+
+      const enc = device.createCommandEncoder();
+      if (!paused) {
+        for (let s = 0; s < stepsPerFrame; s++) {
+          const pass = enc.beginComputePass();
+          pass.setPipeline(gpuPipeline);
+          pass.setBindGroup(0, gpuStep % 2 === 0 ? bindGroupA : bindGroupB);
+          pass.dispatchWorkgroups(Math.ceil(N / 256));
+          pass.end();
+          gpuStep++;
+        }
+      }
+
+      const view2 = gpuContext.getCurrentTexture().createView();
+      const rpass = enc.beginRenderPass({
+        colorAttachments: [{ view: view2, clearValue: { r: 0, g: 0, b: 0.02, a: 1 }, loadOp: 'clear', storeOp: 'store' }]
+      });
+      rpass.setPipeline(gpuRenderPipeline);
+      rpass.setBindGroup(0, gpuStep % 2 === 0 ? renderBindGroupA : renderBindGroupB);
+      rpass.draw(N);
+      rpass.setPipeline(gpuBoxPipeline);
+      rpass.setBindGroup(0, gpuBoxBindGroup);
+      rpass.setVertexBuffer(0, gpuBoxVertBuf);
+      rpass.draw(24);
+      rpass.end();
+      device.queue.submit([enc.finish()]);
+
+    } else {
+      // --- CPU path (async workers) ---
+      if (!paused && !computePending) {
+        computePending = true;
+        const a = 1.0 + expansionRate * simTime;
+        const G_eff = G / (a * a);
+        const H_drag = 2.0 * expansionRate / a;
+        simTime += dt * stepsPerFrame;
+        runWorkerSteps(stepsPerFrame, dt, G_eff, H_drag).then(() => {
+          computePending = false;
+        });
+      }
+      // Always render current state (workers update cpuPos in background)
+      if (use3D) {
+        renderCPU3D(ctx2d, w, h);
+      } else {
+        renderCPU2D(ctx2d, w, h);
       }
     }
 
-    // Render
-    const view2 = context.getCurrentTexture().createView();
-    const rpass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: view2,
-        clearValue: { r: 0.0, g: 0.0, b: 0.02, a: 1 },
-        loadOp: 'clear', storeOp: 'store'
-      }]
-    });
-    rpass.setPipeline(renderPipeline);
-    rpass.setBindGroup(0, step % 2 === 0 ? renderBindGroupA : renderBindGroupB);
-    rpass.draw(N);
-
-    const box = window._box;
-    rpass.setPipeline(box.pipeline);
-    rpass.setBindGroup(0, box.bindGroup);
-    rpass.setVertexBuffer(0, box.vertBuf);
-    rpass.draw(24);  // 12 edges × 2 verts
-
-    rpass.end();
-
-    device.queue.submit([enc.finish()]);
     requestAnimationFrame(frame);
   }
 
   requestAnimationFrame(frame);
+}
+
+// Orthographic MVP for 2D GPU mode — maps [0,BOX_L] x [0,BOX_L] to clip space
+function ortho2DMVP(w, h) {
+  const asp = w / h;
+  const s = cam2DZoom;
+  // Ortho: map cam2DX +/- range to [-1,1]
+  const rangeX = BOX_L / (2 * s);
+  const rangeY = BOX_L / (2 * s);
+  let sx, sy;
+  if (asp > 1) { sx = 1 / (rangeX * asp); sy = 1 / rangeY; }
+  else { sx = 1 / rangeX; sy = 1 / (rangeY / asp); }
+  const tx = -cam2DX * sx;
+  const ty = -cam2DY * sy;
+  // Column-major 4x4: scale x, scale y, trivial z, translate
+  return new Float32Array([
+    sx, 0, 0, 0,
+    0, -sy, 0, 0,   // flip y so +y is down on screen
+    0, 0, 0.001, 0,
+    tx, ty, 0.5, 1
+  ]);
 }
 
 main().catch(e => { document.body.innerHTML = '<pre style="color:red">'+e+'</pre>'; });
